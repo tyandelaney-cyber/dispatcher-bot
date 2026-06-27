@@ -8,14 +8,19 @@ import httpx
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY")
+
 WAITING_LOCATION = 1
+
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
+
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
 JSON format:
@@ -49,76 +54,92 @@ JSON format:
       "instruction": "LIVE UNLOAD or DROP or empty",
       "commodity": "commodity description or empty"
     }
-  ],
-  "special_instructions": "ONLY include a line if it matches ONE of these 4 categories, using EXACTLY this wording (fill in amounts/details from the document where shown):\\n1) 'MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER. DO NOT DEPART WITHOUT CONFIRMATION!!!' -- include this line ONLY if the document requires sending trailer photos/registration and waiting for dispatch confirmation before departure.\\n2) 'LATE PICKUP $X DEDUCTION!!!' -- include ONLY if the document states a late pickup penalty; use the actual dollar amount from the document.\\n3) 'LATE DELIVERY $X DEDUCTION!!!' -- include ONLY if the document states a late delivery penalty; use the actual dollar amount from the document.\\n4) 'MUST USE AMAZON RELAY' -- include ONLY if the document requires use of Amazon Relay.\\nIGNORE and DO NOT include any other warnings, penalties, deductions, check-call requirements, detention policies, tracking app requirements, or any other instructions not matching the 4 categories above. If none of the 4 categories apply, return an empty string. Each included line should be on its own line, with no extra commentary."
+  ]
 }
-Rules:- Include ALL pickup and delivery stops- facility: location name/code- address_line1: street only- address_line2: city, state, zip- special_instructions: STRICTLY limited to the 4 categories described above. Do not include legal/payment boilerplate, broker-carrier agreement text, email addresses, or any other warning type.- Return ONLY the JSON, nothing else"""
+Rules:
+- Include ALL pickup and delivery stops
+- facility: location name/code
+- address_line1: street only
+- address_line2: city, state, zip
+- Return ONLY the JSON, nothing else"""
+
+
 def get_mime(filename):
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
+
+
 def build_message(load_data, empty_miles, loaded_miles):
     lines = []
+
     # Header
-    lines.append(f" Broker:  {load_data.get('broker', '')}")
+    lines.append(f"📌Broker:  {load_data.get('broker', '')}")
     lines.append("Al Amin Express Inc")
     lines.append(f"Load:    {load_data.get('load_number', '')}")
+
     # Pickups
     for pu in load_data.get("pickups", []):
         lines.append("")
-        lines.append(f" PU {pu['number']} :")
+        lines.append(f"🟢PU {pu['number']} :")
         if pu.get("facility"):
             lines.append(pu["facility"])
         if pu.get("address_line1"):
             lines.append(pu["address_line1"])
         if pu.get("address_line2"):
             lines.append(pu["address_line2"])
-        lines.append(f" Date:{pu.get('date', '')}")
-        lines.append(f" time :    {pu.get('time', '')}")
+        lines.append(f"📅Date:{pu.get('date', '')}")
+        lines.append(f"🕔time :    {pu.get('time', '')}")
         lines.append(f"```")
-        lines.append(f" Instruction:{pu.get('instruction', '')}")
-        lines.append(f" Commodity: {pu.get('commodity', '')}")
-        lines.append(f" VRID#")
-        lines.append(f" PU#:")
-        lines.append(f" BOL#")
-        lines.append(f" Appt#")
-        lines.append(f" PO#")
+        lines.append(f"🚛 Instruction:{pu.get('instruction', '')}")
+        lines.append(f"📤Commodity: {pu.get('commodity', '')}")
+        lines.append(f"❕VRID#")
+        lines.append(f"❕PU#:")
+        lines.append(f"❕BOL#")
+        lines.append(f"❕Appt#")
+        lines.append(f"❕PO#")
         lines.append(f"```")
+
     # Deliveries
     for do_ in load_data.get("deliveries", []):
         lines.append("")
-        lines.append(f" DO {do_['number']}:")
+        lines.append(f"🔴DO {do_['number']}:")
         if do_.get("facility"):
             lines.append(do_["facility"])
         if do_.get("address_line1"):
             lines.append(do_["address_line1"])
         if do_.get("address_line2"):
             lines.append(do_["address_line2"])
-        lines.append(f" Date:{do_.get('date', '')}")
-        lines.append(f" time : {do_.get('time', '')}")
+        lines.append(f"📅Date:{do_.get('date', '')}")
+        lines.append(f"🕔time : {do_.get('time', '')}")
         lines.append(f"```")
-        lines.append(f" Instruction:{do_.get('instruction', '')}")
-        lines.append(f" Commodity: {do_.get('commodity', '')}")
-        lines.append(f" VRID#")
-        lines.append(f" PU#:")
-        lines.append(f" BOL#")
-        lines.append(f" Appt#")
-        lines.append(f" PO#")
+        lines.append(f"🚛 Instruction:{do_.get('instruction', '')}")
+        lines.append(f"📤Commodity: {do_.get('commodity', '')}")
+        lines.append(f"❕VRID#")
+        lines.append(f"❕PU#:")
+        lines.append(f"❕BOL#")
+        lines.append(f"❕Appt#")
+        lines.append(f"❕PO#")
         lines.append(f"```")
+
     # Miles
     lines.append("")
     lines.append(f"Empty :  {empty_miles} mile")
     lines.append(f"Loaded :  {loaded_miles} mile")
-    # Special instructions
-    special = load_data.get("special_instructions", "").strip()
-    if special:
-        lines.append("")
-        for item in special.split("\n"):
-            item = item.strip()
-            if item:
-                if not item.startswith(" "):
-                    item = " " + item
-                lines.append(item)
+
+    # Special instructions (always included, fixed text regardless of document content)
+    lines.append("")
+    lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
+    lines.append("DO NOT DEPART WITHOUT CONFIRMATION!!!")
+    lines.append("")
+    lines.append("❌LATE PICKUP $500 DEDUCTION!!!")
+    lines.append("")
+    lines.append("❌LATE DELIVERY $700 DEDUCTION!!!")
+    lines.append("")
+    lines.append("❌MUST USE AMAZON RELAY")
+
     return "\n".join(lines)
+
+
 async def get_distance_miles(origin, destination):
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {
@@ -137,6 +158,8 @@ async def get_distance_miles(origin, destination):
         return round(element["distance"]["value"] / 1609.344)
     except Exception:
         return 0
+
+
 async def calculate_miles(current_location, load_data):
     all_stops = []
     for pu in load_data.get("pickups", []):
@@ -152,9 +175,12 @@ async def calculate_miles(current_location, load_data):
     for i in range(len(all_stops) - 1):
         loaded += await get_distance_miles(all_stops[i], all_stops[i + 1])
     return empty, loaded
+
+
 async def extract_load_data(file_bytes, filename, caption=""):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime = get_mime(filename)
+
     if mime.startswith("image/"):
         image_part = {"mime_type": mime, "data": file_bytes}
         response = model.generate_content([EXTRACT_PROMPT, image_part])
@@ -196,46 +222,44 @@ async def extract_load_data(file_bytes, filename, caption=""):
     else:
         text = file_bytes.decode("utf-8", errors="replace")[:8000]
         response = model.generate_content(EXTRACT_PROMPT + "\n\nFile content:\n" + text)
+
     raw = response.text.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
+
+
 async def start(update, context):
     await update.message.reply_text(
-        " Dispatcher Bot ready!\n\n"
+        "👋 Dispatcher Bot ready!\n\n"
         "Send me a load confirmation (photo, PDF, Word, Excel) and I'll format it.\n"
         "I'll also ask your current location to calculate empty & loaded miles.\n\n"
         "/help for more info."
     )
     return ConversationHandler.END
+
+
 async def help_cmd(update, context):
     await update.message.reply_text(
-        "
- Send any load/rate confirmation:\n"
-        "
-        "
-        "
-        "
- Photo / screenshot\n"
- PDF\n"
- Word (.docx)\n"
- Excel / CSV\n\n"
+        "📌 Send any load/rate confirmation:\n"
+        "🖼 Photo / screenshot\n"
+        "📋 PDF\n"
+        "📄 Word (.docx)\n"
+        "📊 Excel / CSV\n\n"
         "The bot will:\n"
-        "
- Extract all load info\n"
-        "
-        "
-        "
- Ask your current location\n"
- Calculate empty & loaded miles\n"
- Send formatted dispatcher message\n\n"
+        "1️⃣ Extract all load info\n"
+        "2️⃣ Ask your current location\n"
+        "3️⃣ Calculate empty & loaded miles\n"
+        "4️⃣ Send formatted dispatcher message\n\n"
         "/cancel to cancel current operation"
     )
     return ConversationHandler.END
+
+
 async def receive_file(update, context):
     msg = update.message
     caption = msg.caption or ""
-    await msg.reply_text(" Reading document...")
+    await msg.reply_text("⏳ Reading document...")
     try:
         if msg.document:
             f = await msg.document.get_file()
@@ -245,38 +269,45 @@ async def receive_file(update, context):
             f = await msg.photo[-1].get_file()
             file_bytes = bytes(await f.download_as_bytearray())
             filename = "photo.jpg"
+
         load_data = await extract_load_data(file_bytes, filename, caption)
         context.user_data["load_data"] = load_data
+
         pu_count = len(load_data.get("pickups", []))
         do_count = len(load_data.get("deliveries", []))
         await msg.reply_text(
-            " Found: " + str(pu_count) + " pickup(s), " + str(do_count) + " delivery stop(s)\n\n"
-            "
- What's your current location?\n"
+            "✅ Found: " + str(pu_count) + " pickup(s), " + str(do_count) + " delivery stop(s)\n\n"
+            "📍 What's your current location?\n"
             "(Type city name or full address, e.g. 'Dallas, TX')"
         )
         return WAITING_LOCATION
     except Exception as e:
         logger.exception("File processing error")
-        await msg.reply_text(" Error reading file: " + str(e))
+        await msg.reply_text("❌ Error reading file: " + str(e))
         return ConversationHandler.END
+
+
 async def receive_location(update, context):
     current_location = update.message.text.strip()
     load_data = context.user_data.get("load_data", {})
-    await update.message.reply_text(" Calculating miles...")
+    await update.message.reply_text("🗺 Calculating miles...")
     try:
         empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
         final_message = build_message(load_data, empty_miles, loaded_miles)
         await update.message.reply_text(final_message, parse_mode="Markdown")
     except Exception as e:
         logger.exception("Miles calculation error")
-        await update.message.reply_text(" Error: " + str(e))
+        await update.message.reply_text("❌ Error: " + str(e))
     context.user_data.clear()
     return ConversationHandler.END
+
+
 async def cancel(update, context):
     context.user_data.clear()
-    await update.message.reply_text(" Cancelled. Send a new load document whenever you're ready.")
+    await update.message.reply_text("❌ Cancelled. Send a new load document whenever you're ready.")
     return ConversationHandler.END
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv_handler = ConversationHandler(
@@ -295,7 +326,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(conv_handler)
-    logger.info(" Bot running…")
+    logger.info("✅ Bot running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
 if __name__ == "__main__":
     main()
