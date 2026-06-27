@@ -26,7 +26,7 @@ EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
 JSON format:
 {
-  "broker": "broker company name or N/A",
+  "broker": "broker company name only",
   "load_number": "load number",
   "equipment": "equipment type",
   "weight": "total weight with unit",
@@ -54,62 +54,84 @@ JSON format:
       "commodity": "commodity description or empty"
     }
   ],
-  "special_instructions": "any warnings, notes, deductions, keep original text and caps"
+  "special_instructions": "ONLY include critical operational warnings such as: deductions, late fees, required apps, trailer requirements, confirmation requirements, photo requirements. Do NOT include standard legal boilerplate, payment instructions, invoice instructions, broker-carrier agreement text, or email addresses. If there are no critical warnings, return empty string."
 }
 Rules:
 - Include ALL pickup and delivery stops found
 - Addresses must be complete for accurate mileage calculation
+- special_instructions: ONLY warnings, deductions, penalties, required actions (e.g. LATE PICKUP $500 DEDUCTION, MUST USE AMAZON RELAY, MUST SEND TRAILER PICTURES). Ignore all legal/payment/invoice boilerplate.
 - Return ONLY the JSON, nothing else"""
 
 FORMAT_PROMPT = """You are a freight dispatcher assistant.
-Format the dispatcher message EXACTLY as shown below. Copy the emoji and structure exactly.
+Format the dispatcher message EXACTLY as shown in this example. Do not add anything extra.
 
-Use this EXACT format:
+EXAMPLE OUTPUT:
+📌Broker: RAVEN CARGO LOGISTICS
+Al Amin Express Inc
+Load: 0228914
 
-📌Broker: BROKER_NAME
-Load: LOAD_NUMBER
-
-For EACH pickup stop:
-🟢PU NUMBER: FACILITY_NAME
-ADDRESS
-📅Date: DATE
-🕔Time: TIME
-🚛 Instruction: INSTRUCTION
-📤Commodity: COMMODITY
+🟢PU 1: LGE DC (NTX)
+14901 N Beach St, Fort Worth, TX 76177
+📅Date: 06/25/26
+🕔Time: ASAP
+🚛 Instruction: LIVE LOAD
+📤Commodity:
 ❕VRID#
 ❕PU#:
 ❕BOL#
 ❕Appt#
 ❕PO#
 
-For EACH delivery stop:
-🔴DO NUMBER: FACILITY_NAME
-ADDRESS
-📅Date: DATE
-🕔Time: TIME
-🚛 Instruction: INSTRUCTION
-📤Commodity: COMMODITY
+🔴DO 1: SAMS 8234
+3301 EAST PARK & BLASS AVENUE, SEARCY, AR 72143
+📅Date: 06/25/26
+🕔Time: 16:00
+🚛 Instruction: LIVE UNLOAD
+📤Commodity:
 ❕VRID#
 ❕PU#:
 ❕BOL#
 ❕Appt#
 ❕PO#
 
-Empty: EMPTY_MILES mile
-Loaded: LOADED_MILES mile
+🔴DO 2: 6018
+2103 SOUTH MAIN, SEARCY, AR 72143
+📅Date: 06/25/26
+🕔Time: 17:00
+🚛 Instruction: LIVE UNLOAD
+📤Commodity:
+❕VRID#
+❕PU#:
+❕BOL#
+❕Appt#
+❕PO#
 
-💰Rate: RATE (RATE_PER_MILE)
-⚖️Weight: WEIGHT
-🚚Equipment: EQUIPMENT
+Empty: 138 mile
+Loaded: 401 mile
 
-SPECIAL_INSTRUCTIONS
+💰Rate: $2,500.00 ($3.38/mile)
+⚖️Weight: 7,283 lbs
+🚚Equipment: V - Van
+
+❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER TO THE GROUP AND WAIT FOR CONFIRMATION!!!
+❌LATE PICKUP $500 DEDUCTION!!!
+❌LATE DELIVERY $700 DEDUCTION!!!
+❌MUST USE AMAZON RELAY
 
 STRICT RULES:
-- Use EXACTLY these emojis: 📌🟢🔴📅🕔🚛📤❕💰⚖️🚚
-- Every PU and DO stop MUST have all fields including 🚛 Instruction and 📤Commodity
-- DATE format must be MM/DD/YY
-- special_instructions must be printed in FULL with original capitalization
-- Output ONLY the formatted message, absolutely nothing else, no explanation"""
+- Line 1: 📌Broker: BROKER_NAME
+- Line 2: Al Amin Express Inc  (always add this line after broker name)
+- Line 3: Load: LOAD_NUMBER
+- Empty line before each stop
+- 🟢PU for pickups, 🔴DO for deliveries
+- Facility name on SAME line as PU/DO emoji
+- Address on next line (single line, no line breaks in address)
+- Every stop MUST have: 📅Date, 🕔Time, 🚛 Instruction, 📤Commodity, and all 5 ❕ fields
+- Empty and Loaded miles section
+- 💰Rate, ⚖️Weight, 🚚Equipment section
+- special_instructions printed in FULL at the bottom, each warning on its own line
+- If special_instructions is empty, do not print anything at the bottom
+- Output ONLY the message, nothing else, no explanation, no markdown"""
 
 
 def get_mime(filename):
