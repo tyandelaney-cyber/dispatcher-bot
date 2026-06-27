@@ -38,10 +38,15 @@ JSON format:
       "facility": "facility name or empty string",
       "address_line1": "street address only e.g. 14901 N Beach St",
       "address_line2": "city, state, zip e.g. Fort Worth, TX, 76177",
-      "date": "MM/DD/YY",
+      "date": "MM/DD/YYYY",
       "time": "time or ASAP",
       "instruction": "LIVE LOAD or DROP or empty",
-      "commodity": "commodity description or empty"
+      "commodity": "commodity description or empty",
+      "vrid": "VRID number if shown in document, else empty string",
+      "pu_number": "PU number/reference if shown in document, else empty string",
+      "bol": "BOL number if shown in document, else empty string",
+      "appt": "appointment number/confirmation number if shown in document, else empty string",
+      "po": "PO number if shown in document, else empty string"
     }
   ],
   "deliveries": [
@@ -50,10 +55,15 @@ JSON format:
       "facility": "facility name or empty string",
       "address_line1": "street address only e.g. 124 Davis St",
       "address_line2": "city, state, zip e.g. Portland, TN, 37148",
-      "date": "MM/DD/YY",
+      "date": "MM/DD/YYYY",
       "time": "time or ASAP",
       "instruction": "LIVE UNLOAD or DROP or empty",
-      "commodity": "commodity description or empty"
+      "commodity": "commodity description or empty",
+      "vrid": "VRID number if shown in document, else empty string",
+      "pu_number": "PU number/reference if shown in document, else empty string",
+      "bol": "BOL number if shown in document, else empty string",
+      "appt": "appointment number/confirmation number if shown in document, else empty string",
+      "po": "PO number if shown in document, else empty string"
     }
   ]
 }
@@ -62,6 +72,8 @@ Rules:
 - facility: location name/code
 - address_line1: street only
 - address_line2: city, state, zip
+- date: always format as MM/DD/YYYY with a 4-digit year
+- vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
 
 
@@ -73,6 +85,22 @@ def get_mime(filename):
 def _esc(value):
     """Escape text for Telegram HTML parse_mode."""
     return html.escape(str(value), quote=False)
+
+
+def _ref_lines(stop):
+    """Build VRID/PU#/BOL#/Appt#/PO# lines, only including ones that have a value."""
+    fields = [
+        ("VRID#", stop.get("vrid", "")),
+        ("PU#:", stop.get("pu_number", "")),
+        ("BOL#", stop.get("bol", "")),
+        ("Appt#", stop.get("appt", "")),
+        ("PO#", stop.get("po", "")),
+    ]
+    out = []
+    for label, value in fields:
+        if value:
+            out.append(f"❕{label} {_esc(value)}")
+    return out
 
 
 def build_message(load_data, empty_miles, loaded_miles):
@@ -93,18 +121,14 @@ def build_message(load_data, empty_miles, loaded_miles):
             lines.append(_esc(pu["address_line1"]))
         if pu.get("address_line2"):
             lines.append(_esc(pu["address_line2"]))
-        lines.append(f"📅Date:{_esc(pu.get('date', ''))}")
-        lines.append(f"🕔time :    {_esc(pu.get('time', ''))}")
-        code_block = "\n".join([
+        lines.append(f"📅Date: {_esc(pu.get('date', ''))}")
+        lines.append(f"🕔Time :    {_esc(pu.get('time', ''))}")
+        code_lines = [
             f"🚛 Instruction:{_esc(pu.get('instruction', ''))}",
             f"📤Commodity: {_esc(pu.get('commodity', ''))}",
-            "❕VRID#",
-            "❕PU#:",
-            "❕BOL#",
-            "❕Appt#",
-            "❕PO#",
-        ])
-        lines.append(f"<code>{code_block}</code>")
+        ]
+        code_lines.extend(_ref_lines(pu))
+        lines.append(f"<code>{chr(10).join(code_lines)}</code>")
 
     # Deliveries
     for do_ in load_data.get("deliveries", []):
@@ -116,18 +140,14 @@ def build_message(load_data, empty_miles, loaded_miles):
             lines.append(_esc(do_["address_line1"]))
         if do_.get("address_line2"):
             lines.append(_esc(do_["address_line2"]))
-        lines.append(f"📅Date:{_esc(do_.get('date', ''))}")
-        lines.append(f"🕔time : {_esc(do_.get('time', ''))}")
-        code_block = "\n".join([
+        lines.append(f"📅Date: {_esc(do_.get('date', ''))}")
+        lines.append(f"🕔Time : {_esc(do_.get('time', ''))}")
+        code_lines = [
             f"🚛 Instruction:{_esc(do_.get('instruction', ''))}",
             f"📤Commodity: {_esc(do_.get('commodity', ''))}",
-            "❕VRID#",
-            "❕PU#:",
-            "❕BOL#",
-            "❕Appt#",
-            "❕PO#",
-        ])
-        lines.append(f"<code>{code_block}</code>")
+        ]
+        code_lines.extend(_ref_lines(do_))
+        lines.append(f"<code>{chr(10).join(code_lines)}</code>")
 
     # Miles
     lines.append("")
