@@ -62,51 +62,54 @@ Rules:
 - Return ONLY the JSON, nothing else"""
 
 FORMAT_PROMPT = """You are a freight dispatcher assistant.
-Given load data JSON and calculated miles, format the final dispatcher message EXACTLY like this, no extra text, no markdown:
+Format the dispatcher message EXACTLY as shown below. Copy the emoji and structure exactly.
 
-📌Broker: {broker}
-Load: {load_number}
+Use this EXACT format:
 
-For each pickup use this format:
-🟢PU {number}: {facility}
-{address}
-📅Date: {date}
-🕔Time: {time}
-🚛 Instruction: {instruction}
-📤Commodity: {commodity}
+📌Broker: BROKER_NAME
+Load: LOAD_NUMBER
+
+For EACH pickup stop:
+🟢PU NUMBER: FACILITY_NAME
+ADDRESS
+📅Date: DATE
+🕔Time: TIME
+🚛 Instruction: INSTRUCTION
+📤Commodity: COMMODITY
 ❕VRID#
 ❕PU#:
 ❕BOL#
 ❕Appt#
 ❕PO#
 
-For each delivery use this format:
-🔴DO {number}: {facility}
-{address}
-📅Date: {date}
-🕔Time: {time}
-🚛 Instruction: {instruction}
-📤Commodity: {commodity}
+For EACH delivery stop:
+🔴DO NUMBER: FACILITY_NAME
+ADDRESS
+📅Date: DATE
+🕔Time: TIME
+🚛 Instruction: INSTRUCTION
+📤Commodity: COMMODITY
 ❕VRID#
 ❕PU#:
 ❕BOL#
 ❕Appt#
 ❕PO#
 
-Empty: {empty_miles} mile
-Loaded: {loaded_miles} mile
+Empty: EMPTY_MILES mile
+Loaded: LOADED_MILES mile
 
-💰Rate: {rate} ({rate_per_mile})
-⚖️Weight: {weight}
-🚚Equipment: {equipment}
+💰Rate: RATE (RATE_PER_MILE)
+⚖️Weight: WEIGHT
+🚚Equipment: EQUIPMENT
 
-{special_instructions}
+SPECIAL_INSTRUCTIONS
 
-Output ONLY the message, nothing else."""
-
-
-def encode_b64(data):
-    return base64.standard_b64encode(data).decode()
+STRICT RULES:
+- Use EXACTLY these emojis: 📌🟢🔴📅🕔🚛📤❕💰⚖️🚚
+- Every PU and DO stop MUST have all fields including 🚛 Instruction and 📤Commodity
+- DATE format must be MM/DD/YY
+- special_instructions must be printed in FULL with original capitalization
+- Output ONLY the formatted message, absolutely nothing else, no explanation"""
 
 
 def get_mime(filename):
@@ -201,12 +204,10 @@ async def extract_load_data(file_bytes, filename, caption=""):
 async def format_message(load_data, empty_miles, loaded_miles):
     prompt = (
         FORMAT_PROMPT
-        + "\n\nLoad data:\n"
+        + "\n\nLoad data JSON:\n"
         + json.dumps(load_data, indent=2)
-        + "\n\nEmpty miles: "
-        + str(empty_miles)
-        + "\nLoaded miles: "
-        + str(loaded_miles)
+        + "\n\nEmpty miles: " + str(empty_miles)
+        + "\nLoaded miles: " + str(loaded_miles)
     )
     response = model.generate_content(prompt)
     return response.text.strip()
