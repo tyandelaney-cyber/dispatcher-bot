@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import base64
 import logging
 import tempfile
 import mimetypes
@@ -36,7 +35,8 @@ JSON format:
     {
       "number": 1,
       "facility": "facility name or empty string",
-      "address": "full street address, city, state zip",
+      "address_line1": "street address only e.g. 14901 N Beach St",
+      "address_line2": "city, state, zip e.g. Fort Worth, TX, 76177",
       "date": "MM/DD/YY",
       "time": "time or ASAP",
       "instruction": "LIVE LOAD or DROP or empty",
@@ -47,96 +47,99 @@ JSON format:
     {
       "number": 1,
       "facility": "facility name or empty string",
-      "address": "full street address, city, state zip",
+      "address_line1": "street address only e.g. 124 Davis St",
+      "address_line2": "city, state, zip e.g. Portland, TN, 37148",
       "date": "MM/DD/YY",
       "time": "time or ASAP",
       "instruction": "LIVE UNLOAD or DROP or empty",
       "commodity": "commodity description or empty"
     }
   ],
-  "special_instructions": "ONLY include critical operational warnings such as: deductions, late fees, required apps, trailer requirements, confirmation requirements, photo requirements. Do NOT include standard legal boilerplate, payment instructions, invoice instructions, broker-carrier agreement text, or email addresses. If there are no critical warnings, return empty string."
+  "special_instructions": "ONLY critical warnings: deductions, late fees, required apps, trailer requirements, confirmation requirements, photo requirements. Do NOT include legal boilerplate, payment instructions, invoice instructions, broker-carrier agreement text, or email addresses. If none, return empty string."
 }
 Rules:
-- Include ALL pickup and delivery stops found
-- Addresses must be complete for accurate mileage calculation
-- special_instructions: ONLY warnings, deductions, penalties, required actions (e.g. LATE PICKUP $500 DEDUCTION, MUST USE AMAZON RELAY, MUST SEND TRAILER PICTURES). Ignore all legal/payment/invoice boilerplate.
+- Include ALL pickup and delivery stops
+- facility: location name/code
+- address_line1: street only
+- address_line2: city, state, zip
+- special_instructions: ONLY warnings/deductions/penalties. Ignore legal/payment boilerplate.
 - Return ONLY the JSON, nothing else"""
-
-FORMAT_PROMPT = """You are a freight dispatcher assistant.
-Format the dispatcher message EXACTLY as shown in this example. Do not add anything extra.
-
-EXAMPLE OUTPUT:
-📌Broker: RAVEN CARGO LOGISTICS
-Al Amin Express Inc
-Load: 0228914
-
-🟢PU 1: LGE DC (NTX)
-14901 N Beach St, Fort Worth, TX 76177
-📅Date: 06/25/26
-🕔Time: ASAP
-🚛 Instruction: LIVE LOAD
-📤Commodity:
-❕VRID#
-❕PU#:
-❕BOL#
-❕Appt#
-❕PO#
-
-🔴DO 1: SAMS 8234
-3301 EAST PARK & BLASS AVENUE, SEARCY, AR 72143
-📅Date: 06/25/26
-🕔Time: 16:00
-🚛 Instruction: LIVE UNLOAD
-📤Commodity:
-❕VRID#
-❕PU#:
-❕BOL#
-❕Appt#
-❕PO#
-
-🔴DO 2: 6018
-2103 SOUTH MAIN, SEARCY, AR 72143
-📅Date: 06/25/26
-🕔Time: 17:00
-🚛 Instruction: LIVE UNLOAD
-📤Commodity:
-❕VRID#
-❕PU#:
-❕BOL#
-❕Appt#
-❕PO#
-
-Empty: 138 mile
-Loaded: 401 mile
-
-💰Rate: $2,500.00 ($3.38/mile)
-⚖️Weight: 7,283 lbs
-🚚Equipment: V - Van
-
-❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER TO THE GROUP AND WAIT FOR CONFIRMATION!!!
-❌LATE PICKUP $500 DEDUCTION!!!
-❌LATE DELIVERY $700 DEDUCTION!!!
-❌MUST USE AMAZON RELAY
-
-STRICT RULES:
-- Line 1: 📌Broker: BROKER_NAME
-- Line 2: Al Amin Express Inc  (always add this line after broker name)
-- Line 3: Load: LOAD_NUMBER
-- Empty line before each stop
-- 🟢PU for pickups, 🔴DO for deliveries
-- Facility name on SAME line as PU/DO emoji
-- Address on next line (single line, no line breaks in address)
-- Every stop MUST have: 📅Date, 🕔Time, 🚛 Instruction, 📤Commodity, and all 5 ❕ fields
-- Empty and Loaded miles section
-- 💰Rate, ⚖️Weight, 🚚Equipment section
-- special_instructions printed in FULL at the bottom, each warning on its own line
-- If special_instructions is empty, do not print anything at the bottom
-- Output ONLY the message, nothing else, no explanation, no markdown"""
 
 
 def get_mime(filename):
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
+
+
+def build_message(load_data, empty_miles, loaded_miles):
+    lines = []
+
+    # Header
+    lines.append(f"📌Broker:  {load_data.get('broker', '')}")
+    lines.append("Al Amin Express Inc")
+    lines.append(f"Load:    {load_data.get('load_number', '')}")
+
+    # Pickups
+    for pu in load_data.get("pickups", []):
+        lines.append("")
+        lines.append(f"🟢PU {pu['number']} :")
+        if pu.get("facility"):
+            lines.append(pu["facility"])
+        if pu.get("address_line1"):
+            lines.append(pu["address_line1"])
+        if pu.get("address_line2"):
+            lines.append(pu["address_line2"])
+        lines.append(f"📅Date:{pu.get('date', '')}")
+        lines.append(f"🕔time :    {pu.get('time', '')}")
+        lines.append(f"```")
+        lines.append(f"🚛 Instruction:{pu.get('instruction', '')}")
+        lines.append(f"📤Commodity: {pu.get('commodity', '')}")
+        lines.append(f"❕VRID#")
+        lines.append(f"❕PU#:")
+        lines.append(f"❕BOL#")
+        lines.append(f"❕Appt#")
+        lines.append(f"❕PO#")
+        lines.append(f"```")
+
+    # Deliveries
+    for do_ in load_data.get("deliveries", []):
+        lines.append("")
+        lines.append(f"🔴DO {do_['number']}:")
+        if do_.get("facility"):
+            lines.append(do_["facility"])
+        if do_.get("address_line1"):
+            lines.append(do_["address_line1"])
+        if do_.get("address_line2"):
+            lines.append(do_["address_line2"])
+        lines.append(f"📅Date:{do_.get('date', '')}")
+        lines.append(f"🕔time : {do_.get('time', '')}")
+        lines.append(f"```")
+        lines.append(f"🚛 Instruction:{do_.get('instruction', '')}")
+        lines.append(f"📤Commodity: {do_.get('commodity', '')}")
+        lines.append(f"❕VRID#")
+        lines.append(f"❕PU#:")
+        lines.append(f"❕BOL#")
+        lines.append(f"❕Appt#")
+        lines.append(f"❕PO#")
+        lines.append(f"```")
+
+    # Miles
+    lines.append("")
+    lines.append(f"Empty :  {empty_miles} mile")
+    lines.append(f"Loaded :  {loaded_miles} mile")
+
+    # Special instructions
+    special = load_data.get("special_instructions", "").strip()
+    if special:
+        lines.append("")
+        for item in special.split("\n"):
+            item = item.strip()
+            if item:
+                if not item.startswith("❌"):
+                    item = "❌" + item
+                lines.append(item)
+
+    return "\n".join(lines)
 
 
 async def get_distance_miles(origin, destination):
@@ -160,8 +163,13 @@ async def get_distance_miles(origin, destination):
 
 
 async def calculate_miles(current_location, load_data):
-    all_stops = [pu["address"] for pu in load_data.get("pickups", [])]
-    all_stops += [do["address"] for do in load_data.get("deliveries", [])]
+    all_stops = []
+    for pu in load_data.get("pickups", []):
+        addr = pu.get("address_line1", "") + ", " + pu.get("address_line2", "")
+        all_stops.append(addr)
+    for do_ in load_data.get("deliveries", []):
+        addr = do_.get("address_line1", "") + ", " + do_.get("address_line2", "")
+        all_stops.append(addr)
     if not all_stops:
         return 0, 0
     empty = await get_distance_miles(current_location, all_stops[0])
@@ -221,18 +229,6 @@ async def extract_load_data(file_bytes, filename, caption=""):
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
-
-
-async def format_message(load_data, empty_miles, loaded_miles):
-    prompt = (
-        FORMAT_PROMPT
-        + "\n\nLoad data JSON:\n"
-        + json.dumps(load_data, indent=2)
-        + "\n\nEmpty miles: " + str(empty_miles)
-        + "\nLoaded miles: " + str(loaded_miles)
-    )
-    response = model.generate_content(prompt)
-    return response.text.strip()
 
 
 async def start(update, context):
@@ -299,8 +295,8 @@ async def receive_location(update, context):
     await update.message.reply_text("🗺 Calculating miles...")
     try:
         empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
-        final_message = await format_message(load_data, empty_miles, loaded_miles)
-        await update.message.reply_text(final_message)
+        final_message = build_message(load_data, empty_miles, loaded_miles)
+        await update.message.reply_text(final_message, parse_mode="Markdown")
     except Exception as e:
         logger.exception("Miles calculation error")
         await update.message.reply_text("❌ Error: " + str(e))
