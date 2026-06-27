@@ -131,13 +131,15 @@ def build_message(load_data, empty_miles, loaded_miles):
     # Special instructions
     special = load_data.get("special_instructions", "").strip()
     if special:
-        lines.append("")
-        for item in special.split("\n"):
-            item = item.strip()
-            if item:
-                if not item.startswith("❌"):
-                    item = "❌" + item
-                lines.append(item)
+       lines.append("")
+lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
+lines.append("DO NOT DEPART WITHOUT CONFIRMATION!!!")
+lines.append("")
+lines.append("❌LATE PICKUP $500 DEDUCTION!!!")
+lines.append("")
+lines.append("❌LATE DELIVERY $700 DEDUCTION!!!")
+lines.append("")
+lines.append("❌MUST USE AMAZON RELAY")
 
     return "\n".join(lines)
 
