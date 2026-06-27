@@ -1,0 +1,5 @@
+python-telegram-bot==21.5
+anthropic>=0.30.0
+python-docx
+openpyxl
+httpx
