@@ -6,12 +6,12 @@ import logging
 import tempfile
 import mimetypes
 import httpx
-import anthropic
+import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
 GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY")
 
 WAITING_LOCATION = 1
@@ -19,7 +19,8 @@ WAITING_LOCATION = 1
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
@@ -107,7 +108,6 @@ Output ONLY the message, nothing else."""
 def encode_b64(data):
     return base64.standard_b64encode(data).decode()
 
-
 def get_mime(filename):
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
@@ -143,18 +143,13 @@ async def calculate_miles(current_location, load_data):
 async def extract_load_data(file_bytes, filename, caption=""):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime = get_mime(filename)
-    content = []
 
     if mime.startswith("image/"):
-        content = [
-            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": encode_b64(file_bytes)}},
-            {"type": "text", "text": "Extract all load information from this rate confirmation."},
-        ]
+        image_part = {"mime_type": mime, "data": file_bytes}
+        response = model.generate_content([EXTRACT_PROMPT, image_part])
     elif mime == "application/pdf" or ext == "pdf":
-        content = [
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": encode_b64(file_bytes)}},
-            {"type": "text", "text": "Extract all load information from this rate confirmation PDF."},
-        ]
+        image_part = {"mime_type": "application/pdf", "data": file_bytes}
+        response = model.generate_content([EXTRACT_PROMPT, image_part])
     elif ext in ("docx", "doc"):
         try:
             import docx as _docx
@@ -166,7 +161,7 @@ async def extract_load_data(file_bytes, filename, caption=""):
             text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except Exception as e:
             text = "[Could not parse: " + str(e) + "]"
-        content = [{"type": "text", "text": "Extract all load information:\n" + text}]
+        response = model.generate_content(EXTRACT_PROMPT + "\n\nDocument content:\n" + text)
     elif ext in ("xlsx", "xls", "csv"):
         try:
             if ext == "csv":
@@ -186,32 +181,21 @@ async def extract_load_data(file_bytes, filename, caption=""):
                 text = "\n".join(rows)[:8000]
         except Exception as e:
             text = "[Could not parse: " + str(e) + "]"
-        content = [{"type": "text", "text": "Extract all load information:\n" + text}]
+        response = model.generate_content(EXTRACT_PROMPT + "\n\nSpreadsheet content:\n" + text)
     else:
         text = file_bytes.decode("utf-8", errors="replace")[:8000]
-        content = [{"type": "text", "text": "Extract all load information:\n" + text}]
+        response = model.generate_content(EXTRACT_PROMPT + "\n\nFile content:\n" + text)
 
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        system=EXTRACT_PROMPT,
-        messages=[{"role": "user", "content": content}],
-    )
-    raw = resp.content[0].text.strip()
+    raw = response.text.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
 
 
 async def format_message(load_data, empty_miles, loaded_miles):
-    prompt = "Format this load data:\n" + json.dumps(load_data, indent=2) + "\n\nEmpty miles: " + str(empty_miles) + "\nLoaded miles: " + str(loaded_miles) + "\n\nOutput ONLY the formatted dispatcher message."
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        system=FORMAT_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
+    prompt = FORMAT_PROMPT + "\n\nLoad data:\n" + json.dumps(load_data, indent=2) + "\n\nEmpty miles: " + str(empty_miles) + "\nLoaded miles: " + str(loaded_miles)
+    response = model.generate_content(prompt)
+    return response.text.strip()
 
 
 async def start(update, context):
