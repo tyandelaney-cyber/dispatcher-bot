@@ -1,5 +1,5 @@
 python-telegram-bot==21.5
-google-genai>=0.8.0
+google-generativeai
 python-docx
 openpyxl
 httpx
