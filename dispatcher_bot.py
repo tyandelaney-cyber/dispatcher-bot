@@ -4,6 +4,7 @@ import json
 import logging
 import tempfile
 import mimetypes
+import html
 import httpx
 import google.generativeai as genai
 from telegram import Update
@@ -69,57 +70,64 @@ def get_mime(filename):
     return mime or "application/octet-stream"
 
 
+def _esc(value):
+    """Escape text for Telegram HTML parse_mode."""
+    return html.escape(str(value), quote=False)
+
+
 def build_message(load_data, empty_miles, loaded_miles):
     lines = []
 
     # Header
-    lines.append(f"📌Broker:  {load_data.get('broker', '')}")
+    lines.append(f"📌Broker:  {_esc(load_data.get('broker', ''))}")
     lines.append("Al Amin Express Inc")
-    lines.append(f"Load:    {load_data.get('load_number', '')}")
+    lines.append(f"Load:    {_esc(load_data.get('load_number', ''))}")
 
     # Pickups
     for pu in load_data.get("pickups", []):
         lines.append("")
         lines.append(f"🟢PU {pu['number']} :")
         if pu.get("facility"):
-            lines.append(pu["facility"])
+            lines.append(_esc(pu["facility"]))
         if pu.get("address_line1"):
-            lines.append(pu["address_line1"])
+            lines.append(_esc(pu["address_line1"]))
         if pu.get("address_line2"):
-            lines.append(pu["address_line2"])
-        lines.append(f"📅Date:{pu.get('date', '')}")
-        lines.append(f"🕔time :    {pu.get('time', '')}")
-        lines.append(f"```")
-        lines.append(f"🚛 Instruction:{pu.get('instruction', '')}")
-        lines.append(f"📤Commodity: {pu.get('commodity', '')}")
-        lines.append(f"❕VRID#")
-        lines.append(f"❕PU#:")
-        lines.append(f"❕BOL#")
-        lines.append(f"❕Appt#")
-        lines.append(f"❕PO#")
-        lines.append(f"```")
+            lines.append(_esc(pu["address_line2"]))
+        lines.append(f"📅Date:{_esc(pu.get('date', ''))}")
+        lines.append(f"🕔time :    {_esc(pu.get('time', ''))}")
+        code_block = "\n".join([
+            f"🚛 Instruction:{_esc(pu.get('instruction', ''))}",
+            f"📤Commodity: {_esc(pu.get('commodity', ''))}",
+            "❕VRID#",
+            "❕PU#:",
+            "❕BOL#",
+            "❕Appt#",
+            "❕PO#",
+        ])
+        lines.append(f"<code>{code_block}</code>")
 
     # Deliveries
     for do_ in load_data.get("deliveries", []):
         lines.append("")
         lines.append(f"🔴DO {do_['number']}:")
         if do_.get("facility"):
-            lines.append(do_["facility"])
+            lines.append(_esc(do_["facility"]))
         if do_.get("address_line1"):
-            lines.append(do_["address_line1"])
+            lines.append(_esc(do_["address_line1"]))
         if do_.get("address_line2"):
-            lines.append(do_["address_line2"])
-        lines.append(f"📅Date:{do_.get('date', '')}")
-        lines.append(f"🕔time : {do_.get('time', '')}")
-        lines.append(f"```")
-        lines.append(f"🚛 Instruction:{do_.get('instruction', '')}")
-        lines.append(f"📤Commodity: {do_.get('commodity', '')}")
-        lines.append(f"❕VRID#")
-        lines.append(f"❕PU#:")
-        lines.append(f"❕BOL#")
-        lines.append(f"❕Appt#")
-        lines.append(f"❕PO#")
-        lines.append(f"```")
+            lines.append(_esc(do_["address_line2"]))
+        lines.append(f"📅Date:{_esc(do_.get('date', ''))}")
+        lines.append(f"🕔time : {_esc(do_.get('time', ''))}")
+        code_block = "\n".join([
+            f"🚛 Instruction:{_esc(do_.get('instruction', ''))}",
+            f"📤Commodity: {_esc(do_.get('commodity', ''))}",
+            "❕VRID#",
+            "❕PU#:",
+            "❕BOL#",
+            "❕Appt#",
+            "❕PO#",
+        ])
+        lines.append(f"<code>{code_block}</code>")
 
     # Miles
     lines.append("")
@@ -294,7 +302,7 @@ async def receive_location(update, context):
     try:
         empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
         final_message = build_message(load_data, empty_miles, loaded_miles)
-        await update.message.reply_text(final_message, parse_mode="Markdown")
+        await update.message.reply_text(final_message, parse_mode="HTML")
     except Exception as e:
         logger.exception("Miles calculation error")
         await update.message.reply_text("❌ Error: " + str(e))
