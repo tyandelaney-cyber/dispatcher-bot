@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
+chat_model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
@@ -75,6 +76,31 @@ Rules:
 - date: always format as MM/DD/YYYY with a 4-digit year
 - vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
+
+EDIT_PROMPT = """You are a freight dispatcher assistant helping edit load data.
+Below is the CURRENT load data as JSON, followed by an instruction from the dispatcher
+asking to change something about it (e.g. "change DO time to 3:00 PM", "PU 1 sanasini ertaga qo'y").
+
+Decide:
+1. If the dispatcher's message is clearly asking to CHANGE/EDIT/UPDATE/CORRECT something in the load data
+   (times, dates, addresses, facility names, broker, load number, equipment, weight, rate, instructions,
+   commodity, VRID/PU#/BOL#/Appt#/PO#, etc.), apply the change(s) to the JSON and return ONLY the updated
+   JSON object, with the EXACT same structure/fields as the input, no explanation, no markdown, no backticks.
+2. If the message is NOT an edit request (it's a question, comment, or unrelated chat), return ONLY this
+   exact JSON: {{"__not_an_edit__": true}}
+
+Only change the field(s) the dispatcher actually asked about. Keep every other field exactly as it was.
+If the dispatcher refers to "DO" they mean a delivery stop; "PU" means a pickup stop. If they don't specify
+a stop number and there is only one pickup or one delivery, apply it to that one. If there are multiple and
+it's ambiguous which one, make your best reasonable guess based on the message.
+
+CURRENT LOAD DATA:
+{load_data}
+
+DISPATCHER MESSAGE:
+{user_text}
+
+Return ONLY the JSON object described above, nothing else."""
 
 
 def get_mime(filename):
@@ -299,6 +325,7 @@ async def receive_file(update, context):
             filename = "photo.jpg"
 
         load_data = await extract_load_data(file_bytes, filename, caption)
+        context.user_data.clear()
         context.user_data["load_data"] = load_data
 
         pu_count = len(load_data.get("pickups", []))
@@ -323,10 +350,15 @@ async def receive_location(update, context):
         empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
         final_message = build_message(load_data, empty_miles, loaded_miles)
         await update.message.reply_text(final_message, parse_mode="HTML")
+        # Keep context around so the dispatcher can ask for edits afterward
+        # (e.g. "DO vaqtini o'zgartir"). Cleared on /cancel or when a new file arrives.
+        context.user_data["current_location"] = current_location
+        context.user_data["empty_miles"] = empty_miles
+        context.user_data["loaded_miles"] = loaded_miles
     except Exception as e:
         logger.exception("Miles calculation error")
         await update.message.reply_text("❌ Error: " + str(e))
-    context.user_data.clear()
+        context.user_data.clear()
     return ConversationHandler.END
 
 
@@ -334,6 +366,91 @@ async def cancel(update, context):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelled. Send a new load document whenever you're ready.")
     return ConversationHandler.END
+
+
+def _addresses_changed(old_data, new_data):
+    """Check whether any pickup/delivery address changed between two load_data dicts."""
+    def addr_set(data):
+        addrs = []
+        for pu in data.get("pickups", []):
+            addrs.append((pu.get("address_line1", ""), pu.get("address_line2", "")))
+        for do_ in data.get("deliveries", []):
+            addrs.append((do_.get("address_line1", ""), do_.get("address_line2", "")))
+        return addrs
+    return addr_set(old_data) != addr_set(new_data)
+
+
+async def edit_load_data(load_data, user_text):
+    """Ask Gemini whether user_text is an edit request; if so, return the updated load_data.
+    Returns (updated_load_data_or_None, was_edit: bool)."""
+    prompt = EDIT_PROMPT.format(
+        load_data=json.dumps(load_data, ensure_ascii=False),
+        user_text=user_text,
+    )
+    response = model.generate_content(prompt)
+    raw = response.text.strip()
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"```$", "", raw).strip()
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict) and parsed.get("__not_an_edit__"):
+        return None, False
+    return parsed, True
+
+
+async def chat_fallback(update, context):
+    """Handles free-form text messages outside the file->location flow.
+    If a load is active, first checks whether the message is an edit request
+    (e.g. "DO vaqtini o'zgartir") and updates+resends the dispatch message if so.
+    Otherwise answers as a general chat assistant, using load context when available."""
+    user_text = update.message.text.strip()
+    if not user_text:
+        return
+
+    load_data = context.user_data.get("load_data")
+
+    try:
+        if load_data:
+            updated_data, was_edit = await edit_load_data(load_data, user_text)
+            if was_edit:
+                context.user_data["load_data"] = updated_data
+
+                if _addresses_changed(load_data, updated_data) and context.user_data.get("current_location"):
+                    await update.message.reply_text("🗺 Address changed — recalculating miles...")
+                    empty_miles, loaded_miles = await calculate_miles(
+                        context.user_data["current_location"], updated_data
+                    )
+                    context.user_data["empty_miles"] = empty_miles
+                    context.user_data["loaded_miles"] = loaded_miles
+                else:
+                    empty_miles = context.user_data.get("empty_miles", 0)
+                    loaded_miles = context.user_data.get("loaded_miles", 0)
+
+                final_message = build_message(updated_data, empty_miles, loaded_miles)
+                await update.message.reply_text("✅ Updated:")
+                await update.message.reply_text(final_message, parse_mode="HTML")
+                return
+
+            # Not an edit -> fall through to general chat, with load context
+            context_summary = json.dumps(load_data, ensure_ascii=False)
+            prompt = (
+                "You are a helpful assistant for a freight dispatcher. "
+                "The dispatcher is currently working on this load (JSON context):\n"
+                + context_summary
+                + "\n\nAnswer the dispatcher's question or message naturally and helpfully, "
+                "using the load context above when relevant:\n\n" + user_text
+            )
+        else:
+            prompt = (
+                "You are a helpful, friendly assistant chatting with a freight dispatcher. "
+                "Answer naturally and helpfully:\n\n" + user_text
+            )
+
+        response = chat_model.generate_content(prompt)
+        reply = response.text.strip() if response.text else "🤔 I couldn't come up with a response to that."
+        await update.message.reply_text(reply)
+    except Exception as e:
+        logger.exception("Chat fallback error")
+        await update.message.reply_text("❌ Error: " + str(e))
 
 
 def main():
@@ -354,6 +471,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_fallback))
     logger.info("✅ Bot running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
