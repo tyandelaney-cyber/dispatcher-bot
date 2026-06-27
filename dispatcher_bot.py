@@ -20,7 +20,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.0-flash")
 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
@@ -108,6 +108,7 @@ Output ONLY the message, nothing else."""
 def encode_b64(data):
     return base64.standard_b64encode(data).decode()
 
+
 def get_mime(filename):
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
@@ -115,7 +116,12 @@ def get_mime(filename):
 
 async def get_distance_miles(origin, destination):
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    params = {"origins": origin, "destinations": destination, "units": "imperial", "key": GOOGLE_MAPS_KEY}
+    params = {
+        "origins": origin,
+        "destinations": destination,
+        "units": "imperial",
+        "key": GOOGLE_MAPS_KEY
+    }
     async with httpx.AsyncClient(timeout=10) as http:
         r = await http.get(url, params=params)
     data = r.json()
@@ -193,7 +199,15 @@ async def extract_load_data(file_bytes, filename, caption=""):
 
 
 async def format_message(load_data, empty_miles, loaded_miles):
-    prompt = FORMAT_PROMPT + "\n\nLoad data:\n" + json.dumps(load_data, indent=2) + "\n\nEmpty miles: " + str(empty_miles) + "\nLoaded miles: " + str(loaded_miles)
+    prompt = (
+        FORMAT_PROMPT
+        + "\n\nLoad data:\n"
+        + json.dumps(load_data, indent=2)
+        + "\n\nEmpty miles: "
+        + str(empty_miles)
+        + "\nLoaded miles: "
+        + str(loaded_miles)
+    )
     response = model.generate_content(prompt)
     return response.text.strip()
 
