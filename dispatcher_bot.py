@@ -5,6 +5,8 @@ import logging
 import tempfile
 import mimetypes
 import html
+import asyncio
+import random
 import httpx
 import google.generativeai as genai
 from telegram import Update
@@ -22,6 +24,46 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 chat_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+
+MAX_RETRIES = 5
+BASE_DELAY = 5  # seconds
+
+
+def _is_rate_limit_error(exc):
+    msg = str(exc)
+    return "429" in msg or "quota" in msg.lower() or "rate" in msg.lower() and "limit" in msg.lower()
+
+
+def _extract_retry_delay(exc):
+    """Try to read the suggested retry_delay (seconds) from the error message; else None."""
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(exc))
+    if match:
+        return int(match.group(1))
+    match = re.search(r"retry in ([\d.]+)s", str(exc), re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+async def generate_with_retry(gemini_model, *args, **kwargs):
+    """Run gemini_model.generate_content(...) in a thread, retrying with backoff on 429/quota errors."""
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await asyncio.to_thread(gemini_model.generate_content, *args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if not _is_rate_limit_error(e):
+                raise
+            suggested = _extract_retry_delay(e)
+            delay = suggested if suggested is not None else BASE_DELAY * (2 ** attempt)
+            delay = delay + random.uniform(0, 1)  # jitter
+            logger.warning(
+                "Gemini rate-limited (attempt %s/%s), retrying in %.1fs",
+                attempt + 1, MAX_RETRIES, delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc
 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
@@ -237,10 +279,10 @@ async def extract_load_data(file_bytes, filename, caption=""):
 
     if mime.startswith("image/"):
         image_part = {"mime_type": mime, "data": file_bytes}
-        response = model.generate_content([EXTRACT_PROMPT, image_part])
+        response = await generate_with_retry(model, [EXTRACT_PROMPT, image_part])
     elif mime == "application/pdf" or ext == "pdf":
         image_part = {"mime_type": "application/pdf", "data": file_bytes}
-        response = model.generate_content([EXTRACT_PROMPT, image_part])
+        response = await generate_with_retry(model, [EXTRACT_PROMPT, image_part])
     elif ext in ("docx", "doc"):
         try:
             import docx as _docx
@@ -252,7 +294,7 @@ async def extract_load_data(file_bytes, filename, caption=""):
             text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except Exception as e:
             text = "[Could not parse: " + str(e) + "]"
-        response = model.generate_content(EXTRACT_PROMPT + "\n\nDocument content:\n" + text)
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nDocument content:\n" + text)
     elif ext in ("xlsx", "xls", "csv"):
         try:
             if ext == "csv":
@@ -272,10 +314,10 @@ async def extract_load_data(file_bytes, filename, caption=""):
                 text = "\n".join(rows)[:8000]
         except Exception as e:
             text = "[Could not parse: " + str(e) + "]"
-        response = model.generate_content(EXTRACT_PROMPT + "\n\nSpreadsheet content:\n" + text)
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nSpreadsheet content:\n" + text)
     else:
         text = file_bytes.decode("utf-8", errors="replace")[:8000]
-        response = model.generate_content(EXTRACT_PROMPT + "\n\nFile content:\n" + text)
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nFile content:\n" + text)
 
     raw = response.text.strip()
     raw = re.sub(r"^```json\s*", "", raw)
@@ -387,7 +429,7 @@ async def edit_load_data(load_data, user_text):
         load_data=json.dumps(load_data, ensure_ascii=False),
         user_text=user_text,
     )
-    response = model.generate_content(prompt)
+    response = await generate_with_retry(model, prompt)
     raw = response.text.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```$", "", raw).strip()
@@ -445,7 +487,7 @@ async def chat_fallback(update, context):
                 "Answer naturally and helpfully:\n\n" + user_text
             )
 
-        response = chat_model.generate_content(prompt)
+        response = await generate_with_retry(chat_model, prompt)
         reply = response.text.strip() if response.text else "🤔 I couldn't come up with a response to that."
         await update.message.reply_text(reply)
     except Exception as e:
