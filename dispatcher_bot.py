@@ -20,7 +20,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash-001")
+model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
