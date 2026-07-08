@@ -8,7 +8,8 @@ import html
 import asyncio
 import random
 import httpx
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
 
@@ -21,9 +22,10 @@ WAITING_LOCATION = 1
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash-lite")
-chat_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+client = genai.Client(api_key=GEMINI_KEY)
+MODEL_NAME = "gemini-2.5-flash-lite"
+model = MODEL_NAME
+chat_model = MODEL_NAME
 
 MAX_RETRIES = 5
 BASE_DELAY = 5  # seconds
@@ -45,12 +47,14 @@ def _extract_retry_delay(exc):
     return None
 
 
-async def generate_with_retry(gemini_model, *args, **kwargs):
-    """Run gemini_model.generate_content(...) in a thread, retrying with backoff on 429/quota errors."""
+async def generate_with_retry(model_name, contents):
+    """Run client.models.generate_content(...) in a thread, retrying with backoff on 429/quota errors."""
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            return await asyncio.to_thread(gemini_model.generate_content, *args, **kwargs)
+            return await asyncio.to_thread(
+                client.models.generate_content, model=model_name, contents=contents
+            )
         except Exception as e:
             last_exc = e
             if not _is_rate_limit_error(e):
@@ -278,10 +282,10 @@ async def extract_load_data(file_bytes, filename, caption=""):
     mime = get_mime(filename)
 
     if mime.startswith("image/"):
-        image_part = {"mime_type": mime, "data": file_bytes}
+        image_part = types.Part.from_bytes(data=file_bytes, mime_type=mime)
         response = await generate_with_retry(model, [EXTRACT_PROMPT, image_part])
     elif mime == "application/pdf" or ext == "pdf":
-        image_part = {"mime_type": "application/pdf", "data": file_bytes}
+        image_part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
         response = await generate_with_retry(model, [EXTRACT_PROMPT, image_part])
     elif ext in ("docx", "doc"):
         try:
