@@ -12,30 +12,30 @@ from google import genai
 from google.genai import types
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters, ContextTypes
-
+ 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY")
-
+ 
 WAITING_LOCATION = 1
-
+ 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+ 
 client = genai.Client(api_key=GEMINI_KEY)
 MODEL_NAME = "gemini-2.5-flash-lite"
 model = MODEL_NAME
 chat_model = MODEL_NAME
-
+ 
 MAX_RETRIES = 5
 BASE_DELAY = 5  # seconds
-
-
+ 
+ 
 def _is_rate_limit_error(exc):
     msg = str(exc)
     return "429" in msg or "quota" in msg.lower() or "rate" in msg.lower() and "limit" in msg.lower()
-
-
+ 
+ 
 def _extract_retry_delay(exc):
     """Try to read the suggested retry_delay (seconds) from the error message; else None."""
     match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(exc))
@@ -45,8 +45,8 @@ def _extract_retry_delay(exc):
     if match:
         return float(match.group(1))
     return None
-
-
+ 
+ 
 async def generate_with_retry(model_name, contents):
     """Run client.models.generate_content(...) in a thread, retrying with backoff on 429/quota errors."""
     last_exc = None
@@ -68,7 +68,7 @@ async def generate_with_retry(model_name, contents):
             )
             await asyncio.sleep(delay)
     raise last_exc
-
+ 
 EXTRACT_PROMPT = """You are a freight dispatcher assistant.
 Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
 JSON format:
@@ -122,11 +122,11 @@ Rules:
 - date: always format as MM/DD/YYYY with a 4-digit year
 - vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
-
+ 
 EDIT_PROMPT = """You are a freight dispatcher assistant helping edit load data.
 Below is the CURRENT load data as JSON, followed by an instruction from the dispatcher
 asking to change something about it (e.g. "change DO time to 3:00 PM", "PU 1 sanasini ertaga qo'y").
-
+ 
 Decide:
 1. If the dispatcher's message is clearly asking to CHANGE/EDIT/UPDATE/CORRECT something in the load data
    (times, dates, addresses, facility names, broker, load number, equipment, weight, rate, instructions,
@@ -134,31 +134,31 @@ Decide:
    JSON object, with the EXACT same structure/fields as the input, no explanation, no markdown, no backticks.
 2. If the message is NOT an edit request (it's a question, comment, or unrelated chat), return ONLY this
    exact JSON: {{"__not_an_edit__": true}}
-
+ 
 Only change the field(s) the dispatcher actually asked about. Keep every other field exactly as it was.
 If the dispatcher refers to "DO" they mean a delivery stop; "PU" means a pickup stop. If they don't specify
 a stop number and there is only one pickup or one delivery, apply it to that one. If there are multiple and
 it's ambiguous which one, make your best reasonable guess based on the message.
-
+ 
 CURRENT LOAD DATA:
 {load_data}
-
+ 
 DISPATCHER MESSAGE:
 {user_text}
-
+ 
 Return ONLY the JSON object described above, nothing else."""
-
-
+ 
+ 
 def get_mime(filename):
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
-
-
+ 
+ 
 def _esc(value):
     """Escape text for Telegram HTML parse_mode."""
     return html.escape(str(value), quote=False)
-
-
+ 
+ 
 def _ref_lines(stop):
     """Build VRID/PU#/BOL#/Appt#/PO# lines, only including ones that have a value."""
     fields = [
@@ -173,16 +173,16 @@ def _ref_lines(stop):
         if value:
             out.append(f"❕{label} {_esc(value)}")
     return out
-
-
+ 
+ 
 def build_message(load_data, empty_miles, loaded_miles):
     lines = []
-
+ 
     # Header
     lines.append(f"📌Broker:  {_esc(load_data.get('broker', ''))}")
     lines.append("Al Amin Express Inc")
     lines.append(f"Load:    {_esc(load_data.get('load_number', ''))}")
-
+ 
     # Pickups
     for pu in load_data.get("pickups", []):
         lines.append("")
@@ -201,7 +201,7 @@ def build_message(load_data, empty_miles, loaded_miles):
         ]
         code_lines.extend(_ref_lines(pu))
         lines.append(f"<code>{chr(10).join(code_lines)}</code>")
-
+ 
     # Deliveries
     for do_ in load_data.get("deliveries", []):
         lines.append("")
@@ -220,12 +220,12 @@ def build_message(load_data, empty_miles, loaded_miles):
         ]
         code_lines.extend(_ref_lines(do_))
         lines.append(f"<code>{chr(10).join(code_lines)}</code>")
-
+ 
     # Miles
     lines.append("")
     lines.append(f"Empty :  {empty_miles} mile")
     lines.append(f"Loaded :  {loaded_miles} mile")
-
+ 
     # Special instructions (always included, fixed text regardless of document content)
     lines.append("")
     lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
@@ -236,10 +236,10 @@ def build_message(load_data, empty_miles, loaded_miles):
     lines.append("❌LATE DELIVERY $700 DEDUCTION!!!")
     lines.append("")
     lines.append("❌MUST USE AMAZON RELAY")
-
+ 
     return "\n".join(lines)
-
-
+ 
+ 
 async def get_distance_miles(origin, destination):
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {
@@ -258,8 +258,8 @@ async def get_distance_miles(origin, destination):
         return round(element["distance"]["value"] / 1609.344)
     except Exception:
         return 0
-
-
+ 
+ 
 async def calculate_miles(current_location, load_data):
     all_stops = []
     for pu in load_data.get("pickups", []):
@@ -275,12 +275,12 @@ async def calculate_miles(current_location, load_data):
     for i in range(len(all_stops) - 1):
         loaded += await get_distance_miles(all_stops[i], all_stops[i + 1])
     return empty, loaded
-
-
+ 
+ 
 async def extract_load_data(file_bytes, filename, caption=""):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime = get_mime(filename)
-
+ 
     if mime.startswith("image/"):
         image_part = types.Part.from_bytes(data=file_bytes, mime_type=mime)
         response = await generate_with_retry(model, [EXTRACT_PROMPT, image_part])
@@ -322,13 +322,13 @@ async def extract_load_data(file_bytes, filename, caption=""):
     else:
         text = file_bytes.decode("utf-8", errors="replace")[:8000]
         response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nFile content:\n" + text)
-
+ 
     raw = response.text.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```$", "", raw).strip()
     return json.loads(raw)
-
-
+ 
+ 
 async def start(update, context):
     await update.message.reply_text(
         "👋 Dispatcher Bot ready!\n\n"
@@ -337,8 +337,8 @@ async def start(update, context):
         "/help for more info."
     )
     return ConversationHandler.END
-
-
+ 
+ 
 async def help_cmd(update, context):
     await update.message.reply_text(
         "📌 Send any load/rate confirmation:\n"
@@ -354,8 +354,8 @@ async def help_cmd(update, context):
         "/cancel to cancel current operation"
     )
     return ConversationHandler.END
-
-
+ 
+ 
 async def receive_file(update, context):
     msg = update.message
     caption = msg.caption or ""
@@ -369,11 +369,11 @@ async def receive_file(update, context):
             f = await msg.photo[-1].get_file()
             file_bytes = bytes(await f.download_as_bytearray())
             filename = "photo.jpg"
-
+ 
         load_data = await extract_load_data(file_bytes, filename, caption)
         context.user_data.clear()
         context.user_data["load_data"] = load_data
-
+ 
         pu_count = len(load_data.get("pickups", []))
         do_count = len(load_data.get("deliveries", []))
         await msg.reply_text(
@@ -386,8 +386,8 @@ async def receive_file(update, context):
         logger.exception("File processing error")
         await msg.reply_text("❌ Error reading file: " + str(e))
         return ConversationHandler.END
-
-
+ 
+ 
 async def receive_location(update, context):
     current_location = update.message.text.strip()
     load_data = context.user_data.get("load_data", {})
@@ -406,14 +406,14 @@ async def receive_location(update, context):
         await update.message.reply_text("❌ Error: " + str(e))
         context.user_data.clear()
     return ConversationHandler.END
-
-
+ 
+ 
 async def cancel(update, context):
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelled. Send a new load document whenever you're ready.")
     return ConversationHandler.END
-
-
+ 
+ 
 def _addresses_changed(old_data, new_data):
     """Check whether any pickup/delivery address changed between two load_data dicts."""
     def addr_set(data):
@@ -424,8 +424,8 @@ def _addresses_changed(old_data, new_data):
             addrs.append((do_.get("address_line1", ""), do_.get("address_line2", "")))
         return addrs
     return addr_set(old_data) != addr_set(new_data)
-
-
+ 
+ 
 async def edit_load_data(load_data, user_text):
     """Ask Gemini whether user_text is an edit request; if so, return the updated load_data.
     Returns (updated_load_data_or_None, was_edit: bool)."""
@@ -441,8 +441,8 @@ async def edit_load_data(load_data, user_text):
     if isinstance(parsed, dict) and parsed.get("__not_an_edit__"):
         return None, False
     return parsed, True
-
-
+ 
+ 
 async def chat_fallback(update, context):
     """Handles free-form text messages outside the file->location flow.
     If a load is active, first checks whether the message is an edit request
@@ -451,15 +451,15 @@ async def chat_fallback(update, context):
     user_text = update.message.text.strip()
     if not user_text:
         return
-
+ 
     load_data = context.user_data.get("load_data")
-
+ 
     try:
         if load_data:
             updated_data, was_edit = await edit_load_data(load_data, user_text)
             if was_edit:
                 context.user_data["load_data"] = updated_data
-
+ 
                 if _addresses_changed(load_data, updated_data) and context.user_data.get("current_location"):
                     await update.message.reply_text("🗺 Address changed — recalculating miles...")
                     empty_miles, loaded_miles = await calculate_miles(
@@ -470,12 +470,12 @@ async def chat_fallback(update, context):
                 else:
                     empty_miles = context.user_data.get("empty_miles", 0)
                     loaded_miles = context.user_data.get("loaded_miles", 0)
-
+ 
                 final_message = build_message(updated_data, empty_miles, loaded_miles)
                 await update.message.reply_text("✅ Updated:")
                 await update.message.reply_text(final_message, parse_mode="HTML")
                 return
-
+ 
             # Not an edit -> fall through to general chat, with load context
             context_summary = json.dumps(load_data, ensure_ascii=False)
             prompt = (
@@ -490,15 +490,15 @@ async def chat_fallback(update, context):
                 "You are a helpful, friendly assistant chatting with a freight dispatcher. "
                 "Answer naturally and helpfully:\n\n" + user_text
             )
-
+ 
         response = await generate_with_retry(chat_model, prompt)
         reply = response.text.strip() if response.text else "🤔 I couldn't come up with a response to that."
         await update.message.reply_text(reply)
     except Exception as e:
         logger.exception("Chat fallback error")
         await update.message.reply_text("❌ Error: " + str(e))
-
-
+ 
+ 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv_handler = ConversationHandler(
@@ -520,7 +520,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_fallback))
     logger.info("✅ Bot running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
