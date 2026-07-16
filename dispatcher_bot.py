@@ -120,6 +120,7 @@ Rules:
 - address_line1: street only
 - address_line2: city, state, zip
 - date: always format as MM/DD/YYYY with a 4-digit year
+- time: always format with a colon, e.g. "16:00" or "16:00-16:00" for a window. If the source document shows two raw values like "1600 1600" or "0700 0900", convert them to "16:00-16:00" or "07:00-09:00". Never output raw unformatted digits.
 - vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
  
@@ -197,12 +198,14 @@ def build_message(load_data, empty_miles, loaded_miles):
         lines.append("")
         lines.append(f"📅Date: {_esc(pu.get('date', ''))}")
         lines.append(f"🕔Time : {_esc(pu.get('time', ''))}")
-        code_lines = [
-            f"🚛 Instruction:{_esc(pu.get('instruction', ''))}",
-            f"📤Commodity: {_esc(pu.get('commodity', ''))}",
-        ]
+        code_lines = []
+        if pu.get("instruction"):
+            code_lines.append(f"🚛 Instruction:{_esc(pu['instruction'])}")
+        if pu.get("commodity"):
+            code_lines.append(f"📤Commodity: {_esc(pu['commodity'])}")
         code_lines.extend(_ref_lines(pu))
-        lines.append(f"<code>{chr(10).join(code_lines)}</code>")
+        if code_lines:
+            lines.append(f"<code>{chr(10).join(code_lines)}</code>")
  
     # Deliveries
     for do_ in load_data.get("deliveries", []):
@@ -218,12 +221,14 @@ def build_message(load_data, empty_miles, loaded_miles):
         lines.append("")
         lines.append(f"📅Date: {_esc(do_.get('date', ''))}")
         lines.append(f"🕔Time : {_esc(do_.get('time', ''))}")
-        code_lines = [
-            f"🚛 Instruction:{_esc(do_.get('instruction', ''))}",
-            f"📤Commodity: {_esc(do_.get('commodity', ''))}",
-        ]
+        code_lines = []
+        if do_.get("instruction"):
+            code_lines.append(f"🚛 Instruction:{_esc(do_['instruction'])}")
+        if do_.get("commodity"):
+            code_lines.append(f"📤Commodity: {_esc(do_['commodity'])}")
         code_lines.extend(_ref_lines(do_))
-        lines.append(f"<code>{chr(10).join(code_lines)}</code>")
+        if code_lines:
+            lines.append(f"<code>{chr(10).join(code_lines)}</code>")
  
     # Miles
     lines.append("")
