@@ -23,7 +23,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
  
 client = genai.Client(api_key=GEMINI_KEY)
-MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_NAME = "gemini-3.1-flash-lite"
 model = MODEL_NAME
 chat_model = MODEL_NAME
  
