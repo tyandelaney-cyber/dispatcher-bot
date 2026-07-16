@@ -187,14 +187,16 @@ def build_message(load_data, empty_miles, loaded_miles):
     for pu in load_data.get("pickups", []):
         lines.append("")
         lines.append(f"🟢PU {pu['number']} :")
+        lines.append("")
         if pu.get("facility"):
             lines.append(_esc(pu["facility"]))
         if pu.get("address_line1"):
             lines.append(_esc(pu["address_line1"]))
         if pu.get("address_line2"):
             lines.append(_esc(pu["address_line2"]))
+        lines.append("")
         lines.append(f"📅Date: {_esc(pu.get('date', ''))}")
-        lines.append(f"🕔Time :    {_esc(pu.get('time', ''))}")
+        lines.append(f"🕔Time : {_esc(pu.get('time', ''))}")
         code_lines = [
             f"🚛 Instruction:{_esc(pu.get('instruction', ''))}",
             f"📤Commodity: {_esc(pu.get('commodity', ''))}",
@@ -206,12 +208,14 @@ def build_message(load_data, empty_miles, loaded_miles):
     for do_ in load_data.get("deliveries", []):
         lines.append("")
         lines.append(f"🔴DO {do_['number']}:")
+        lines.append("")
         if do_.get("facility"):
             lines.append(_esc(do_["facility"]))
         if do_.get("address_line1"):
             lines.append(_esc(do_["address_line1"]))
         if do_.get("address_line2"):
             lines.append(_esc(do_["address_line2"]))
+        lines.append("")
         lines.append(f"📅Date: {_esc(do_.get('date', ''))}")
         lines.append(f"🕔Time : {_esc(do_.get('time', ''))}")
         code_lines = [
