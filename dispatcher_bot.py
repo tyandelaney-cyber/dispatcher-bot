@@ -32,11 +32,6 @@ MAX_RETRIES = 5
 BASE_DELAY = 5  # seconds
 
 # --- Authentication -------------------------------------------------------
-# In-memory set of Telegram user IDs that have entered the correct password.
-# NOTE: this resets whenever the bot restarts/redeploys (Railway containers
-# are ephemeral). Authorized users will simply need to re-enter the password
-# after a redeploy. This is intentional to keep things simple; ask if you'd
-# like this persisted to a file/database instead.
 AUTHORIZED_USERS = set()
 
 
@@ -49,7 +44,6 @@ async def request_password(update):
 
 
 async def handle_password_attempt(update, context):
-    """Called when an unauthorized user sends any message. Checks it against BOT_PASSWORD."""
     text = (update.message.text or "").strip() if update.message and update.message.text else ""
     if not text:
         await request_password(update)
@@ -64,8 +58,6 @@ async def handle_password_attempt(update, context):
 
 
 def require_auth(handler_func):
-    """Decorator: blocks the wrapped handler until the user has authenticated.
-    Works for both plain handlers and ConversationHandler entry points/states."""
     async def wrapped(update, context, *args, **kwargs):
         user = update.effective_user
         if user is None or not is_authorized(user.id):
@@ -79,11 +71,16 @@ def require_auth(handler_func):
 
 def _is_rate_limit_error(exc):
     msg = str(exc)
-    return "429" in msg or "quota" in msg.lower() or "rate" in msg.lower() and "limit" in msg.lower()
+    return (
+        "429" in msg
+        or "503" in msg
+        or "UNAVAILABLE" in msg
+        or "quota" in msg.lower()
+        or ("rate" in msg.lower() and "limit" in msg.lower())
+    )
 
 
 def _extract_retry_delay(exc):
-    """Try to read the suggested retry_delay (seconds) from the error message; else None."""
     match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(exc))
     if match:
         return int(match.group(1))
@@ -94,7 +91,6 @@ def _extract_retry_delay(exc):
 
 
 async def generate_with_retry(model_name, contents):
-    """Run client.models.generate_content(...) in a thread, retrying with backoff on 429/quota errors."""
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -107,9 +103,9 @@ async def generate_with_retry(model_name, contents):
                 raise
             suggested = _extract_retry_delay(e)
             delay = suggested if suggested is not None else BASE_DELAY * (2 ** attempt)
-            delay = delay + random.uniform(0, 1)  # jitter
+            delay = delay + random.uniform(0, 1)
             logger.warning(
-                "Gemini rate-limited (attempt %s/%s), retrying in %.1fs",
+                "Gemini rate-limited/unavailable (attempt %s/%s), retrying in %.1fs",
                 attempt + 1, MAX_RETRIES, delay,
             )
             await asyncio.sleep(delay)
@@ -201,12 +197,10 @@ def get_mime(filename):
 
 
 def _esc(value):
-    """Escape text for Telegram HTML parse_mode."""
     return html.escape(str(value), quote=False)
 
 
 def _ref_lines(stop):
-    """Build VRID/PU#/BOL#/Appt#/PO# lines, only including ones that have a value."""
     fields = [
         ("VRID#", stop.get("vrid", "")),
         ("PU#:", stop.get("pu_number", "")),
@@ -223,13 +217,10 @@ def _ref_lines(stop):
 
 def build_message(load_data, empty_miles, loaded_miles):
     lines = []
-
-    # Header
     lines.append(f"📌Broker:  {_esc(load_data.get('broker', ''))}")
     lines.append("Al Amin Express Inc")
     lines.append(f"Load:    {_esc(load_data.get('load_number', ''))}")
 
-    # Pickups
     for pu in load_data.get("pickups", []):
         lines.append("")
         lines.append(f"🟢PU {pu['number']} :")
@@ -248,7 +239,6 @@ def build_message(load_data, empty_miles, loaded_miles):
         code_lines.extend(_ref_lines(pu))
         lines.append(f"<code>{chr(10).join(code_lines)}</code>")
 
-    # Deliveries
     for do_ in load_data.get("deliveries", []):
         lines.append("")
         lines.append(f"🔴DO {do_['number']}:")
@@ -267,12 +257,10 @@ def build_message(load_data, empty_miles, loaded_miles):
         code_lines.extend(_ref_lines(do_))
         lines.append(f"<code>{chr(10).join(code_lines)}</code>")
 
-    # Miles
     lines.append("")
     lines.append(f"Empty :  {empty_miles} mile")
     lines.append(f"Loaded :  {loaded_miles} mile")
 
-    # Special instructions (always included, fixed text regardless of document content)
     lines.append("")
     lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
     lines.append("DO NOT DEPART WITHOUT CONFIRMATION!!!")
@@ -446,8 +434,6 @@ async def receive_location(update, context):
         empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
         final_message = build_message(load_data, empty_miles, loaded_miles)
         await update.message.reply_text(final_message, parse_mode="HTML")
-        # Keep context around so the dispatcher can ask for edits afterward
-        # (e.g. "DO vaqtini o'zgartir"). Cleared on /cancel or when a new file arrives.
         context.user_data["current_location"] = current_location
         context.user_data["empty_miles"] = empty_miles
         context.user_data["loaded_miles"] = loaded_miles
@@ -466,7 +452,6 @@ async def cancel(update, context):
 
 
 def _addresses_changed(old_data, new_data):
-    """Check whether any pickup/delivery address changed between two load_data dicts."""
     def addr_set(data):
         addrs = []
         for pu in data.get("pickups", []):
@@ -478,8 +463,6 @@ def _addresses_changed(old_data, new_data):
 
 
 async def edit_load_data(load_data, user_text):
-    """Ask Gemini whether user_text is an edit request; if so, return the updated load_data.
-    Returns (updated_load_data_or_None, was_edit: bool)."""
     prompt = EDIT_PROMPT.format(
         load_data=json.dumps(load_data, ensure_ascii=False),
         user_text=user_text,
@@ -496,10 +479,6 @@ async def edit_load_data(load_data, user_text):
 
 @require_auth
 async def chat_fallback(update, context):
-    """Handles free-form text messages outside the file->location flow.
-    If a load is active, first checks whether the message is an edit request
-    (e.g. "DO vaqtini o'zgartir") and updates+resends the dispatch message if so.
-    Otherwise answers as a general chat assistant, using load context when available."""
     user_text = update.message.text.strip()
     if not user_text:
         return
@@ -528,7 +507,6 @@ async def chat_fallback(update, context):
                 await update.message.reply_text(final_message, parse_mode="HTML")
                 return
 
-            # Not an edit -> fall through to general chat, with load context
             context_summary = json.dumps(load_data, ensure_ascii=False)
             prompt = (
                 "You are a helpful assistant for a freight dispatcher. "
