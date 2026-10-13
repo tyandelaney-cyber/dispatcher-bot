@@ -23,7 +23,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dispatcher-bot")
 
-# ---------- CONFIG (hosting dashboard -> Environment variables) ----------
+# ---------- CONFIG (Fly.io -> Secrets) ----------
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MAPS_API_KEY = os.environ["GOOGLE_MAPS_API_KEY"]
