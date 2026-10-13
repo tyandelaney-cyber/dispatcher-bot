@@ -143,22 +143,26 @@ def extract_load(data: bytes, mime: str, filename: str = "") -> dict:
 
 # ---------- MAPS ----------
 async def miles_between(origin: str, dest: str) -> float | None:
+    """Driving miles via Google Routes API (Distance Matrix is legacy)."""
     if not origin or not dest:
         return None
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    params = {
-        "origins": origin,
-        "destinations": dest,
-        "units": "imperial",
-        "key": MAPS_API_KEY,
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "X-Goog-Api-Key": MAPS_API_KEY,
+        "X-Goog-FieldMask": "routes.distanceMeters",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "origin": {"address": origin},
+        "destination": {"address": dest},
+        "travelMode": "DRIVE",
     }
     try:
         async with httpx.AsyncClient(timeout=20) as http:
-            r = await http.get(url, params=params)
-        el = r.json()["rows"][0]["elements"][0]
-        if el.get("status") != "OK":
-            return None
-        return el["distance"]["value"] / 1609.344
+            r = await http.post(url, headers=headers, json=body)
+        data = r.json()
+        meters = data["routes"][0]["distanceMeters"]
+        return meters / 1609.344
     except Exception as exc:
         log.warning("maps failed: %s", exc)
         return None
