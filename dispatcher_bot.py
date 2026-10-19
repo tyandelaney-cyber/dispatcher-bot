@@ -203,33 +203,4 @@ def maps_route(a: str, b: str) -> str:
 
 # ---------- FORMATTING (pure Python, no API calls) ----------
 def when(s: dict) -> str:
-    return " ".join(x for x in [s.get("date", ""), s.get("time", "")] if x)
-
-
-def format_load(d: dict, loaded: float | None, dh: float | None):
-    e = escape
-    pu, do = d["pickup"], d["delivery"]
-    route = maps_route(pu["address"], do["address"])
-
-    pay = float(d.get("pay") or 0)
-    total_miles = (loaded or 0) + (dh or 0)
-    rpm = f"${pay / total_miles:.2f}/mi" if pay and total_miles else "—"
-    miles_txt = f"{round(loaded):,}" if loaded else "—"
-
-    carrier = f"🚚 <b>Carrier:</b> {e(CARRIER_NAME)}"
-    if CARRIER_MC:
-        carrier += f" • <b>MC</b> {e(CARRIER_MC)}"
-
-    def stop(icon: str, title: str, s: dict) -> str:
-        return (
-            f"{icon} <b>{title}</b>\n"
-            f"📅 <b>{e(when(s))}</b>\n"
-            f"🏠 {e(s.get('name', ''))}\n"
-            f"<pre>{e(s['address'])}</pre>\n"
-            f"👉 <a href=\"{maps_search(s['address'])}\">GOOGLE MAP</a>"
-        )
-
-    header = (
-        f"📦 <b>NEW LOAD</b> • 🏷 <b>REF:</b> {e(str(d.get('ref', '')))}\n"
-        f"{carrier}\n"
-        f"🤝 <b>Broker:</b>
+    return " ".join(x
