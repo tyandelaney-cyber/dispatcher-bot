@@ -1,8 +1,10 @@
+import asyncio
 import io
 import json
 import logging
 import os
 import re
+import time
 from html import escape
 from urllib.parse import quote_plus
 
@@ -43,6 +45,7 @@ GEMINI_API_KEY = env("GEMINI_API_KEY", "GOOGLE_API_KEY")
 MAPS_API_KEY = env("GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_KEY", "MAPS_API_KEY")
 BOT_PASSWORD = env("BOT_PASSWORD")
 GEMINI_MODEL = env("GEMINI_MODEL", required=False, default="gemini-3.8-flash")
+GEMINI_FALLBACK = env("GEMINI_FALLBACK_MODEL", required=False)
 CARRIER_NAME = env("CARRIER_NAME", required=False, default="Al Amin Express Inc")
 CARRIER_MC = env("CARRIER_MC", required=False)
 DEFAULT_LOCATION = env("DEFAULT_LOCATION", required=False)
@@ -159,13 +162,32 @@ def extract_load(data: bytes, mime: str, filename: str = "") -> dict:
         contents = [PROMPT, xlsx_text(data)]
     else:
         contents = [PROMPT, types.Part.from_bytes(data=data, mime_type=mime)]
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json", temperature=0
-        ),
-    )
+    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK] if GEMINI_FALLBACK else [])
+    last_exc: Exception | None = None
+    resp = None
+    for model in models:
+        for attempt in range(5):
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json", temperature=0
+                    ),
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                busy = any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+                log.warning("gemini %s attempt %d failed: %s", model, attempt + 1, msg[:120])
+                if not busy:
+                    raise
+                time.sleep(2 * (attempt + 1))
+        if resp is not None:
+            break
+    if resp is None:
+        raise last_exc or RuntimeError("Gemini javob bermadi")
     return json.loads(resp.text)
 
 
@@ -458,7 +480,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text("⏳ O'qilyapti...")
     try:
         data = bytes(await tg_file.download_as_bytearray())
-        d = extract_load(data, mime, filename)
+        d = await asyncio.to_thread(extract_load, data, mime, filename)
 
         pu_addr = d["pickup"]["address"]
         do_addr = d["delivery"]["address"]
