@@ -1,12 +1,10 @@
-import asyncio
 import io
 import json
 import logging
 import os
 import re
-import time
-from html import escape
-from urllib.parse import quote_plus
+import unicodedata
+from html import escape as _escape
 
 import httpx
 from docx import Document
@@ -25,6 +23,10 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dispatcher-bot")
 
+def escape(s: str) -> str:
+    return _escape(s, quote=False)
+
+
 # ---------- CONFIG (Fly.io -> Secrets) ----------
 MISSING: list[str] = []
 
@@ -42,18 +44,12 @@ def env(*names: str, required: bool = True, default: str = "") -> str:
 
 BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN")
 GEMINI_API_KEY = env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-MAPS_API_KEY = env("GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_KEY", "MAPS_API_KEY")
+MAPS_API_KEY = env("GOOGLE_MAPS_API_KEY", "MAPS_API_KEY")
 BOT_PASSWORD = env("BOT_PASSWORD")
-GEMINI_MODEL = env("GEMINI_MODEL", required=False, default="gemini-3.8-flash")
-GEMINI_FALLBACK = env("GEMINI_FALLBACK_MODEL", required=False)
+GEMINI_MODEL = env("GEMINI_MODEL", required=False, default="gemini-2.5-flash")
 CARRIER_NAME = env("CARRIER_NAME", required=False, default="Al Amin Express Inc")
-CARRIER_MC = env("CARRIER_MC", required=False)
 DEFAULT_LOCATION = env("DEFAULT_LOCATION", required=False)
-AUTH_FILE = env(
-    "AUTH_FILE",
-    required=False,
-    default="/data/auth.json" if os.path.isdir("/data") else "auth.json",
-)
+AUTH_FILE = env("AUTH_FILE", required=False, default="auth.json")
 
 if MISSING:
     seen = sorted(
@@ -65,31 +61,44 @@ if MISSING:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-PROMPT = """You extract data from a freight rate confirmation. Return ONLY JSON:
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+PROMPT = """You read a freight load document (broker rate confirmation, Amazon Relay load,
+screenshot, or pasted text). First decide "kind":
+- "amazon": an Amazon Relay trip (Trip ID or Map ID, facility codes like CLT2 or POLY_PAK_07105_272,
+  stop types such as Preloaded, Drop, Live, Loaded - Live, Empty - Drop).
+- "regular": any other broker rate confirmation.
+
+Return ONLY JSON in this shape (fill the matching object, the other one is null):
 {
-  "ref": "load/reference number",
-  "broker": "broker company name",
-  "po": "PO number or empty string",
-  "pay": number (total rate in USD, no symbols),
-  "pickup": {
-    "name": "facility name",
-    "address": "street, city, state zip",
-    "date": "MM/DD/YY",
-    "time": "HH:MM 24h with colon, or window HH:MM-HH:MM; empty if none"
+  "kind": "regular" or "amazon",
+  "regular": {
+    "broker": "broker company name",
+    "load": "load / reference number",
+    "pickups": [ STOP, ... ],
+    "deliveries": [ STOP, ... ],
+    "warnings": ["every penalty, deduction or mandatory requirement stated in the document,
+                  one short UPPERCASE line each, keep dollar amounts and the word DEDUCTION"]
   },
-  "delivery": {
-    "name": "facility name",
-    "address": "street, city, state zip",
-    "date": "MM/DD/YY",
-    "time": "HH:MM 24h with colon, or window HH:MM-HH:MM; empty if none (use 24/7 if stated)"
-  },
-  "weight": "weight as written, or empty",
-  "equipment": "e.g. Reefer 53' / Dry Van 53'",
-  "commodity": "commodity description or empty",
-  "requirements": "short one-line summary of special requirements (apps, tracking, trailer, phone rules), or empty"
+  "amazon": {
+    "id_label": "MAP" or "TRIP",
+    "id": "map id or trip id",
+    "stops": [ {"type": "e.g. Loaded - Live", "date": "as written, e.g. Tue, Oct 13, 09:30 AM EDT",
+                "name": "facility code/name", "street": "street", "city": "CITY, ST ZIP"} ],
+    "pay": number or 0,
+    "rpm": number or 0,
+    "miles": number or 0,
+    "duration": "e.g. 13h 0m or empty",
+    "equipment": "or empty",
+    "special": "special services or empty",
+    "penalties": [ {"label": "Late PU", "amount": 1000} ]
+  }
 }
-Rules: times must always be colon formatted (16:00, never 1600). Use empty string
-when data is missing. Never invent values."""
+STOP = {"name": "facility name", "street": "street", "city": "city", "state": "2-letter state",
+        "zip": "zip", "date": "MM/DD/YYYY", "time": "HHMM 24h without colon, or HHMM-HHMM window, or empty",
+        "instruction": "DROP / LIVE / etc, or empty", "commodity": "or empty",
+        "pu_number": "pickup number or empty", "bol": "BOL number or empty"}
+Rules: use empty string when data is missing. Never invent values."""
 
 
 # ---------- AUTH ----------
@@ -125,15 +134,13 @@ async def gate(update: Update) -> bool:
             await update.message.delete()
         except Exception:
             pass
-        await update.effective_chat.send_message(
-            "✅ Parol to'g'ri. Rate confirmation yuboring."
-        )
+        await update.effective_chat.send_message("✅ Parol to'g'ri. Rate confirmation yuboring.")
         return False
     await update.effective_chat.send_message("🔒 Parolni kiriting.")
     return False
 
 
-# ---------- FILE READING ----------
+# ---------- FILE READING + GEMINI ----------
 def docx_text(data: bytes) -> str:
     doc = Document(io.BytesIO(data))
     lines = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -154,7 +161,18 @@ def xlsx_text(data: bytes) -> str:
     return "\n".join(lines)
 
 
-def extract_load(data: bytes, mime: str, filename: str = "") -> dict:
+def gemini_json(contents: list) -> dict:
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json", temperature=0
+        ),
+    )
+    return json.loads(resp.text)
+
+
+def extract_file(data: bytes, mime: str, filename: str = "") -> dict:
     name = filename.lower()
     if name.endswith(".docx"):
         contents = [PROMPT, docx_text(data)]
@@ -162,38 +180,16 @@ def extract_load(data: bytes, mime: str, filename: str = "") -> dict:
         contents = [PROMPT, xlsx_text(data)]
     else:
         contents = [PROMPT, types.Part.from_bytes(data=data, mime_type=mime)]
-    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK] if GEMINI_FALLBACK else [])
-    last_exc: Exception | None = None
-    resp = None
-    for model in models:
-        for attempt in range(5):
-            try:
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json", temperature=0
-                    ),
-                )
-                break
-            except Exception as exc:
-                last_exc = exc
-                msg = str(exc)
-                busy = any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
-                log.warning("gemini %s attempt %d failed: %s", model, attempt + 1, msg[:120])
-                if not busy:
-                    raise
-                time.sleep(2 * (attempt + 1))
-        if resp is not None:
-            break
-    if resp is None:
-        raise last_exc or RuntimeError("Gemini javob bermadi")
-    return json.loads(resp.text)
+    return gemini_json(contents)
 
 
-# ---------- MAPS ----------
+def extract_text(text: str) -> dict:
+    return gemini_json([PROMPT, text])
+
+
+# ---------- MAPS (Routes API) ----------
 async def miles_between(origin: str, dest: str) -> float | None:
-    """Driving miles via Google Routes API (Distance Matrix is legacy)."""
+    """Driving miles via Google Routes API."""
     if not origin or not dest:
         return None
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
@@ -210,117 +206,151 @@ async def miles_between(origin: str, dest: str) -> float | None:
     try:
         async with httpx.AsyncClient(timeout=20) as http:
             r = await http.post(url, headers=headers, json=body)
-        data = r.json()
-        meters = data["routes"][0]["distanceMeters"]
+        meters = r.json()["routes"][0]["distanceMeters"]
         return meters / 1609.344
     except Exception as exc:
         log.warning("maps failed: %s", exc)
         return None
 
 
-def maps_search(q: str) -> str:
-    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
+async def chain_miles(addrs: list[str]) -> float | None:
+    if len(addrs) < 2:
+        return None
+    total = 0.0
+    for a, b in zip(addrs, addrs[1:]):
+        m = await miles_between(a, b)
+        if m is None:
+            return None
+        total += m
+    return total
 
 
-def maps_route(a: str, b: str) -> str:
-    return (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&origin={quote_plus(a)}&destination={quote_plus(b)}&travelmode=driving"
-    )
+def full_address(s: dict) -> str:
+    tail = " ".join(x for x in [s.get("state", ""), s.get("zip", "")] if x)
+    return ", ".join(x for x in [s.get("street", ""), s.get("city", ""), tail] if x)
 
 
-# ---------- FORMATTING (pure Python, no API calls) ----------
-def when(s: dict) -> str:
-    parts = [s.get("date", ""), s.get("time", "")]
-    return " ".join(x for x in parts if x)
+# ---------- REGULAR DISPATCH FORMAT ----------
+def city_line(s: dict) -> str:
+    parts = [
+        str(s.get("city", "")).upper(),
+        str(s.get("state", "")).upper(),
+        str(s.get("zip", "")),
+    ]
+    return ", ".join(p for p in parts if p)
 
 
-def format_load(d: dict, loaded: float | None, dh: float | None):
+def reg_stop(head: str, s: dict, pu: bool = False) -> str:
     e = escape
-    pu, do = d["pickup"], d["delivery"]
-    route = maps_route(pu["address"], do["address"])
-
-    pay = float(d.get("pay") or 0)
-    total_miles = (loaded or 0) + (dh or 0)
-    rpm = f"${pay / total_miles:.2f}/mi" if pay and total_miles else "—"
-    miles_txt = f"{round(loaded):,}" if loaded else "—"
-
-    carrier = f"🚚 <b>Carrier:</b> {e(CARRIER_NAME)}"
-    if CARRIER_MC:
-        carrier += f" • <b>MC</b> {e(CARRIER_MC)}"
-
-    def stop(icon: str, title: str, s: dict) -> str:
-        return (
-            f"{icon} <b>{title}</b>\n"
-            f"📅 <b>{e(when(s))}</b>\n"
-            f"🏠 {e(s.get('name', ''))}\n"
-            f"<pre>{e(s['address'])}</pre>\n"
-            f"👉 <a href=\"{maps_search(s['address'])}\">GOOGLE MAP</a>"
-        )
-
-    header = (
-        f"📦 <b>NEW LOAD</b> • 🏷 <b>REF:</b> {e(str(d.get('ref', '')))}\n"
-        f"{carrier}\n"
-        f"🤝 <b>Broker:</b> {e(d.get('broker', ''))}"
-    )
-    if d.get("po"):
-        header += f"\n<b>PO#</b> {e(str(d['po']))}"
-
-    money = (
-        f"💰 <b>PAY:</b> ${pay:,.0f}\n"
-        f"📉 <b>RPM:</b> {rpm}\n"
-        f"🚛 <b>Miles:</b> {miles_txt}\n"
-        f"🗺 <a href=\"{route}\">Open full route</a>"
-    )
-
-    specs = []
-    if d.get("weight"):
-        specs.append(f"• ⚖️ {e(str(d['weight']))}")
-    if d.get("equipment"):
-        specs.append(f"• 🚛 {e(d['equipment'])}")
-    if d.get("commodity"):
-        specs.append(f"• 📦 {e(d['commodity'])}")
-
-    parts = [header, money, stop("🛫", "Pickup", pu), stop("🏁", "Delivery", do)]
-    if specs:
-        parts.append("📦 <b>Load Specs</b>\n" + "\n".join(specs))
-    if d.get("requirements"):
-        parts.append(f"⚠️ <b>Requirements:</b> {e(d['requirements'])}")
-    parts.append(f"➡️📋 <a href=\"{route}\">DRIVER INSTRUCTIONS — tap to open</a>")
-
-    return "\n\n".join(parts), route
+    lines = [head]
+    for v in (s.get("name"), s.get("street"), city_line(s)):
+        if v:
+            lines.append(e(str(v)))
+    if s.get("date"):
+        lines.append(f"📅Date: {e(str(s['date']))}")
+    if s.get("time"):
+        lines.append(f"🕔Time : {e(str(s['time']))}")
+    if s.get("instruction"):
+        lines.append(f"<code>🚛 Instruction:{e(str(s['instruction']).upper())}</code>")
+    if s.get("commodity"):
+        lines.append(f"<code>📤Commodity: {e(str(s['commodity']))}</code>")
+    if pu and s.get("pu_number"):
+        lines.append(f"<code>❕PU#: {e(str(s['pu_number']))}</code>")
+    if s.get("bol"):
+        lines.append(f"<code>❕BOL# {e(str(s['bol']))}</code>")
+    return "\n".join(lines)
 
 
-# ---------- AMAZON (pasted Relay trip text, parsed in pure Python) ----------
-STOP_RE = re.compile(
-    r"📍\s*(\d+)#:\s*(.+?)\n\s*(.+?)\n\s*(.+?)\n\s*(.+?)\n\s*(.+?)\n\s*📅\s*Date:\s*(.+)"
-)
+def format_regular(r: dict, empty_miles: float | None, loaded_miles: float | None) -> str:
+    e = escape
+    parts = [
+        f"📌Broker: {e(str(r.get('broker', '')))}\n"
+        f"{e(CARRIER_NAME)}\n"
+        f"Load: {e(str(r.get('load', '')))}"
+    ]
+    for i, s in enumerate(r.get("pickups") or [], 1):
+        parts.append(reg_stop(f"🟢PU {i} :", s, pu=True))
+    for i, s in enumerate(r.get("deliveries") or [], 1):
+        parts.append(reg_stop(f"🔴DO {i}:", s))
+    em = f"{round(empty_miles)}" if empty_miles is not None else "—"
+    lm = f"{round(loaded_miles)}" if loaded_miles is not None else "—"
+    parts.append(f"Empty : {em} mile\nLoaded : {lm} mile")
+    for w in r.get("warnings") or []:
+        parts.append("❌" + e(str(w).strip()))
+    return "\n\n".join(parts)
 
 
-def is_amazon(text: str) -> bool:
-    return bool(re.search(r"TRIP ID", text, re.I)) and "📍" in text
+# ---------- AMAZON FORMAT ----------
+SEP = "—————————————"
 
 
-def parse_amazon(text: str) -> dict:
+def bold(s: str) -> str:
+    """Oddiy harflarni qalin unicode (𝗥𝗮𝘁𝗲) ga aylantiradi."""
+    out = []
+    for ch in s:
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D5D4 + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(0x1D5EE + ord(ch) - 97))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def norm(text: str) -> str:
+    """Qalin unicode harflarni (𝗥𝗮𝘁𝗲) oddiy ASCII ga aylantiradi."""
+    return unicodedata.normalize("NFKC", text)
+
+
+ID_RE = re.compile(r"(TRIP|MAP)\s*ID\s*:\s*(\S+)", re.I)
+SEP_RE = re.compile(r"^[—–\-_=]{3,}$")
+SUMMARY_START = ("🚛", "🕒", "💰", "💵", "❌")
+
+
+def is_amazon_text(text: str) -> bool:
+    t = norm(text)
+    return bool(ID_RE.search(t)) and "📍" in t
+
+
+def parse_stop(chunk: str) -> dict | None:
+    lines = [ln.strip() for ln in chunk.splitlines()]
+    head = re.match(r"📍\s*(\d+)#:", lines[0]) if lines else None
+    if not head:
+        return None
+    body = []
+    for ln in lines[1:]:
+        if not ln:
+            continue
+        if SEP_RE.match(ln) or ln.startswith(SUMMARY_START):
+            break
+        body.append(ln)
+
+    date, rest = "", []
+    for ln in body:
+        if ln.startswith("📅") or re.search(r"\d{1,2}:\d{2}", ln):
+            date = re.sub(r"^📅\s*(Date:)?\s*", "", ln).strip()
+        else:
+            rest.append(ln)
+
+    if len(rest) < 3:
+        return None
+    typ = rest[0] if len(rest) >= 4 else ""
+    core = rest[1:] if len(rest) >= 4 else rest
+    return {
+        "type": typ,
+        "date": date,
+        "name": core[0],
+        "street": ", ".join(core[1:-1]),
+        "city": core[-1],
+    }
+
+
+def parse_amazon_text(raw: str) -> dict:
+    text = norm(raw)
+
     def g(pattern: str, default: str = "") -> str:
-        m = re.search(pattern, text)
+        m = re.search(pattern, text, re.I)
         return m.group(1).strip() if m else default
-
-    stops = []
-    for m in STOP_RE.finditer(text):
-        idx, code, typ, name, street, city, date = (x.strip() for x in m.groups())
-        stops.append(
-            {
-                "n": idx,
-                "code": code,
-                "type": typ,
-                "name": name,
-                "street": street,
-                "city": city,
-                "address": f"{street}, {city}",
-                "date": date,
-            }
-        )
 
     def num(s: str) -> float:
         try:
@@ -328,8 +358,18 @@ def parse_amazon(text: str) -> dict:
         except ValueError:
             return 0.0
 
+    stops = []
+    for chunk in re.split(r"(?=📍\s*\d+#:)", text):
+        chunk = chunk.lstrip()
+        if chunk.startswith("📍"):
+            s = parse_stop(chunk)
+            if s:
+                stops.append(s)
+
+    idm = ID_RE.search(text)
     return {
-        "trip_id": g(r"TRIP ID:\s*(\S+)"),
+        "id_label": idm.group(1).upper() if idm else "TRIP",
+        "id": idm.group(2) if idm else "",
         "stops": stops,
         "equipment": g(r"Equipment:\s*(.+)"),
         "special": g(r"Special Services:\s*(.+)"),
@@ -337,71 +377,86 @@ def parse_amazon(text: str) -> dict:
         "miles": num(g(r"Trip:\s*([\d,\.]+)\s*mi")),
         "pay": num(g(r"Rate:\s*\$([\d,\.]+)")),
         "rpm": num(g(r"\$([\d\.]+)\s*/\s*mi")),
-        "penalties": re.findall(r"❌\s*(.+?):\s*\$([\d,]+)", text),
+        "penalties": [
+            {"label": k, "amount": v}
+            for k, v in re.findall(r"❌\s*(.+?):\s*\$([\d,]+)", text)
+        ],
     }
 
 
-def format_amazon(a: dict, dh: float | None):
-    e = escape
-    stops = a["stops"]
-    addrs = [s["address"] for s in stops]
-    route = (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&origin={quote_plus(addrs[0])}"
-        f"&destination={quote_plus(addrs[-1])}&travelmode=driving"
+def to_float(v) -> float:
+    try:
+        return float(str(v).replace(",", "").replace("$", ""))
+    except ValueError:
+        return 0.0
+
+
+def format_amazon(a: dict) -> str:
+    pay = to_float(a.get("pay"))
+    miles = to_float(a.get("miles"))
+    rpm = to_float(a.get("rpm")) or (pay / miles if pay and miles else 0)
+    ident = str(a.get("id", ""))
+    label = str(a.get("id_label") or "TRIP").upper()
+
+    out = [f"{label} {bold('ID')} : {ident}", ""]
+    for i, s in enumerate(a.get("stops") or [], 1):
+        out.append(f"📍{i}#: {ident}")
+        out.append("")
+        if s.get("type"):
+            out.append(str(s["type"]))
+        if s.get("date"):
+            out.append(str(s["date"]))
+        out.append("")
+        for v in (s.get("name"), s.get("street"), s.get("city")):
+            if v:
+                out.append(str(v))
+        out.append(SEP)
+        out.append("")
+
+    if pay:
+        out.append(f"💰 {bold('Rate')}: ${pay:,.2f}")
+    if rpm:
+        out.append(f"💰 Per mile: ${rpm:.2f}/mi")
+    out.append("")
+    if miles:
+        out.append(f"🚛 {bold('Trip')}: {miles:,.0f}mi")
+    if a.get("duration"):
+        out.append(f"🕒 Duration: {a['duration']}")
+    if a.get("equipment"):
+        out.append(f"🚛 Equipment: {a['equipment']}")
+    if a.get("special"):
+        out.append(f"🚛 Special Services: {a['special']}")
+    pens = a.get("penalties") or []
+    if pens:
+        out.append("")
+        for p in pens:
+            amt = to_float(p.get("amount"))
+            out.append(f"❌{p.get('label', '')}: ${amt:.0f}")
+    return "\n".join(out).strip()
+
+
+# ---------- SENDING ----------
+async def send_result(msg, result: dict, truck: str) -> None:
+    kind = result.get("kind")
+    if kind == "amazon" and result.get("amazon"):
+        await msg.reply_text(
+            format_amazon(result["amazon"]), link_preview_options=NO_PREVIEW
+        )
+        return
+
+    r = result.get("regular") or {}
+    pickups = r.get("pickups") or []
+    deliveries = r.get("deliveries") or []
+    stops = [full_address(s) for s in pickups + deliveries]
+    loaded = await chain_miles(stops)
+    empty = None
+    if truck and pickups:
+        empty = await miles_between(truck, full_address(pickups[0]))
+    await msg.reply_text(
+        format_regular(r, empty, loaded),
+        parse_mode="HTML",
+        link_preview_options=NO_PREVIEW,
     )
-    if len(addrs) > 2:
-        route += "&waypoints=" + quote_plus("|".join(addrs[1:-1]))
-
-    rpm = a["rpm"] or (a["pay"] / a["miles"] if a["miles"] else 0)
-    carrier = f"🚚 <b>Carrier:</b> {e(CARRIER_NAME)}"
-    if CARRIER_MC:
-        carrier += f" • <b>MC</b> {e(CARRIER_MC)}"
-
-    money = [
-        f"💰 <b>PAY:</b> ${a['pay']:,.2f}",
-        f"📉 <b>RPM:</b> ${rpm:.2f}/mi",
-        f"🚛 <b>Miles:</b> {a['miles']:,.0f}",
-    ]
-    if a["duration"]:
-        money.append(f"🕒 <b>Duration:</b> {e(a['duration'])}")
-    if dh is not None and a["pay"] and a["miles"]:
-        rpm_dh = a["pay"] / (a["miles"] + dh)
-        money.append(
-            f"📍 <b>DH:</b> {dh:,.0f} mi • <b>RPM w/ DH:</b> ${rpm_dh:.2f}/mi"
-        )
-    money.append(f"🗺 <a href=\"{route}\">Open full route</a>")
-
-    parts = [
-        f"🅰️ <b>AMAZON LOAD</b> • 🏷 <b>TRIP:</b> {e(a['trip_id'])}\n"
-        f"{carrier}\n"
-        "🤝 <b>Broker:</b> Amazon Relay",
-        "\n".join(money),
-    ]
-
-    for s in stops:
-        parts.append(
-            f"📍 <b>Stop {e(s['n'])} — {e(s['type'])}</b>\n"
-            f"📅 <b>{e(s['date'])}</b>\n"
-            f"🏠 {e(s['name'])}\n"
-            f"<pre>{e(s['street'])}\n{e(s['city'])}</pre>\n"
-            f"👉 <a href=\"{maps_search(s['address'])}\">GOOGLE MAP</a>"
-        )
-
-    specs = []
-    if a["equipment"]:
-        specs.append(f"• 🚛 {e(a['equipment'])}")
-    if a["special"]:
-        specs.append(f"• ⭐ Special Services: {e(a['special'])}")
-    if specs:
-        parts.append("📦 <b>Load Specs</b>\n" + "\n".join(specs))
-
-    if a["penalties"]:
-        lines = "\n".join(f"• {e(k)}: ${e(v)}" for k, v in a["penalties"])
-        parts.append(f"⚠️ <b>Penalties:</b>\n{lines}")
-
-    parts.append(f"➡️📋 <a href=\"{route}\">DRIVER INSTRUCTIONS — tap to open</a>")
-    return "\n\n".join(parts), route
 
 
 # ---------- HANDLERS ----------
@@ -409,7 +464,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await gate(update):
         return
     await update.message.reply_text(
-        "Rate confirmation yuboring (PDF, rasm, Word, Excel).\n"
+        "Rate confirmation yuboring (PDF, rasm, Word, Excel) yoki matnini tashlang.\n"
         "Truck joylashuvi: /loc Atlanta, GA"
     )
 
@@ -421,9 +476,7 @@ async def set_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = " ".join(context.args).strip()
     if not loc:
         cur = context.user_data.get("loc") or DEFAULT_LOCATION or "yo'q"
-        await update.message.reply_text(
-            f"Hozirgi joylashuv: {cur}\nO'zgartirish: /loc City, ST"
-        )
+        await update.message.reply_text(f"Hozirgi joylashuv: {cur}\nO'zgartirish: /loc City, ST")
         return
     context.user_data["loc"] = loc
     await update.message.reply_text(f"📍 Joylashuv: {loc}")
@@ -432,33 +485,31 @@ async def set_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await gate(update):
         return
-    text = update.message.text or ""
-    if is_amazon(text):
-        try:
-            a = parse_amazon(text)
+    msg = update.message
+    text = msg.text or ""
+    truck = context.user_data.get("loc") or DEFAULT_LOCATION
+
+    try:
+        if is_amazon_text(text):
+            a = parse_amazon_text(text)
             if not a["stops"]:
                 raise ValueError("stop'lar topilmadi, matnni to'liq tashlang")
-            truck = context.user_data.get("loc") or DEFAULT_LOCATION
-            dh = (
-                await miles_between(truck, a["stops"][0]["address"])
-                if truck
-                else None
-            )
-            out, route = format_amazon(a, dh)
-            await update.message.reply_text(
-                out,
-                parse_mode="HTML",
-                link_preview_options=LinkPreviewOptions(
-                    url=route, show_above_text=False, prefer_large_media=False
-                ),
-            )
-        except Exception as exc:
-            log.exception("amazon parse failed")
-            await update.message.reply_text(f"❌ Xatolik: {exc}")
-        return
-    await update.message.reply_text(
-        "Rate confirmation fayl/rasm yuboring yoki Amazon trip matnini tashlang."
-    )
+            await send_result(msg, {"kind": "amazon", "amazon": a}, truck)
+        elif len(text.strip()) >= 80:
+            status = await msg.reply_text("⏳ O'qilyapti...")
+            try:
+                result = extract_text(text)
+                await send_result(msg, result, truck)
+            finally:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+        else:
+            await msg.reply_text("Rate confirmation fayl/rasm yuboring yoki yuk matnini tashlang.")
+    except Exception as exc:
+        log.exception("text processing failed")
+        await msg.reply_text(f"❌ Xatolik: {exc}")
 
 
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,23 +531,9 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text("⏳ O'qilyapti...")
     try:
         data = bytes(await tg_file.download_as_bytearray())
-        d = await asyncio.to_thread(extract_load, data, mime, filename)
-
-        pu_addr = d["pickup"]["address"]
-        do_addr = d["delivery"]["address"]
+        result = extract_file(data, mime, filename)
         truck = context.user_data.get("loc") or DEFAULT_LOCATION
-
-        loaded = await miles_between(pu_addr, do_addr)
-        dh = await miles_between(truck, pu_addr) if truck else None
-
-        text, route = format_load(d, loaded, dh)
-        await msg.reply_text(
-            text,
-            parse_mode="HTML",
-            link_preview_options=LinkPreviewOptions(
-                url=route, show_above_text=False, prefer_large_media=False
-            ),
-        )
+        await send_result(msg, result, truck)
     except Exception as exc:
         log.exception("processing failed")
         await msg.reply_text(f"❌ Xatolik: {exc}")
