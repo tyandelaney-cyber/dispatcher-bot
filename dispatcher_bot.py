@@ -83,14 +83,12 @@ Return ONLY JSON in this shape (fill the matching object, the other one is null)
   "amazon": {
     "id_label": "MAP" or "TRIP",
     "id": "map id or trip id",
-    "stops": [ {"type": "e.g. Loaded - Live", "date": "as written, e.g. Tue, Oct 13, 09:30 AM EDT",
-                "name": "facility code/name", "street": "street", "city": "CITY, ST ZIP"} ],
-    "pay": number or 0,
-    "rpm": number or 0,
-    "miles": number or 0,
-    "duration": "e.g. 13h 0m or empty",
-    "equipment": "or empty",
-    "special": "special services or empty",
+    "stops": [ {"stop_id": "the id printed after the stop number, e.g. 1129LLGC6",
+                "type": "e.g. Loaded - Drop", "date": "as written, e.g. Sun, Oct 12, 06:37 PM EDT",
+                "name": "facility code/name, e.g. BOS3", "street": "street", "city": "City, ST ZIP"} ],
+    "miles": trip miles as number or 0,
+    "dh": deadhead miles as number or 0,
+    "duration": "e.g. 15H 45M or empty",
     "penalties": [ {"label": "Late PU", "amount": 1000} ]
   }
 }
@@ -284,19 +282,6 @@ def format_regular(r: dict, empty_miles: float | None, loaded_miles: float | Non
 SEP = "—————————————"
 
 
-def bold(s: str) -> str:
-    """Oddiy harflarni qalin unicode (𝗥𝗮𝘁𝗲) ga aylantiradi."""
-    out = []
-    for ch in s:
-        if "A" <= ch <= "Z":
-            out.append(chr(0x1D5D4 + ord(ch) - 65))
-        elif "a" <= ch <= "z":
-            out.append(chr(0x1D5EE + ord(ch) - 97))
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
 def norm(text: str) -> str:
     """Qalin unicode harflarni (𝗥𝗮𝘁𝗲) oddiy ASCII ga aylantiradi."""
     return unicodedata.normalize("NFKC", text)
@@ -314,7 +299,7 @@ def is_amazon_text(text: str) -> bool:
 
 def parse_stop(chunk: str) -> dict | None:
     lines = [ln.strip() for ln in chunk.splitlines()]
-    head = re.match(r"📍\s*(\d+)#:", lines[0]) if lines else None
+    head = re.match(r"📍\s*(\d+)#:\s*(.*)", lines[0]) if lines else None
     if not head:
         return None
     body = []
@@ -337,6 +322,7 @@ def parse_stop(chunk: str) -> dict | None:
     typ = rest[0] if len(rest) >= 4 else ""
     core = rest[1:] if len(rest) >= 4 else rest
     return {
+        "stop_id": head.group(2).strip(),
         "type": typ,
         "date": date,
         "name": core[0],
@@ -362,21 +348,18 @@ def parse_amazon_text(raw: str) -> dict:
     for chunk in re.split(r"(?=📍\s*\d+#:)", text):
         chunk = chunk.lstrip()
         if chunk.startswith("📍"):
-            s = parse_stop(chunk)
-            if s:
-                stops.append(s)
+            st = parse_stop(chunk)
+            if st:
+                stops.append(st)
 
     idm = ID_RE.search(text)
     return {
         "id_label": idm.group(1).upper() if idm else "TRIP",
         "id": idm.group(2) if idm else "",
         "stops": stops,
-        "equipment": g(r"Equipment:\s*(.+)"),
-        "special": g(r"Special Services:\s*(.+)"),
-        "duration": g(r"Duration:\s*(.+)"),
         "miles": num(g(r"Trip:\s*([\d,\.]+)\s*mi")),
-        "pay": num(g(r"Rate:\s*\$([\d,\.]+)")),
-        "rpm": num(g(r"\$([\d\.]+)\s*/\s*mi")),
+        "dh": num(g(r"DH:\s*([\d,\.]+)")),
+        "duration": g(r"Duration:\s*(.+)"),
         "penalties": [
             {"label": k, "amount": v}
             for k, v in re.findall(r"❌\s*(.+?):\s*\$([\d,]+)", text)
@@ -391,56 +374,49 @@ def to_float(v) -> float:
         return 0.0
 
 
-def format_amazon(a: dict) -> str:
-    pay = to_float(a.get("pay"))
-    miles = to_float(a.get("miles"))
-    rpm = to_float(a.get("rpm")) or (pay / miles if pay and miles else 0)
+def format_amazon(a: dict, dh: float | None) -> str:
+    e = escape
     ident = str(a.get("id", ""))
-    label = str(a.get("id_label") or "TRIP").upper()
+    label = "Map" if str(a.get("id_label", "")).upper() == "MAP" else "Trip"
+    miles = to_float(a.get("miles"))
 
-    out = [f"{label} {bold('ID')} : {ident}", ""]
-    for i, s in enumerate(a.get("stops") or [], 1):
-        out.append(f"📍{i}#: {ident}")
-        out.append("")
-        if s.get("type"):
-            out.append(str(s["type"]))
-        if s.get("date"):
-            out.append(str(s["date"]))
-        out.append("")
-        for v in (s.get("name"), s.get("street"), s.get("city")):
+    out = [f"🗺 <b>{label} ID :</b> {e(ident)}"]
+    for i, st in enumerate(a.get("stops") or [], 1):
+        out.append(f"📍{i}#: {e(str(st.get('stop_id') or ident))}")
+        for v in (st.get("type"), st.get("date"), st.get("name"), st.get("street"), st.get("city")):
             if v:
-                out.append(str(v))
+                out.append(e(str(v)))
         out.append(SEP)
-        out.append("")
 
-    if pay:
-        out.append(f"💰 {bold('Rate')}: ${pay:,.2f}")
-    if rpm:
-        out.append(f"💰 Per mile: ${rpm:.2f}/mi")
-    out.append("")
     if miles:
-        out.append(f"🚛 {bold('Trip')}: {miles:,.0f}mi")
+        out.append(f"🚛 <b>Trip:</b> {miles:,.0f}mi")
+    out.append(f"DH: {round(dh) if dh is not None else '—'}")
     if a.get("duration"):
-        out.append(f"🕒 Duration: {a['duration']}")
-    if a.get("equipment"):
-        out.append(f"🚛 Equipment: {a['equipment']}")
-    if a.get("special"):
-        out.append(f"🚛 Special Services: {a['special']}")
+        out.append(f"🕒 Duration: {e(str(a['duration']).upper())}")
     pens = a.get("penalties") or []
     if pens:
         out.append("")
         for p in pens:
-            amt = to_float(p.get("amount"))
-            out.append(f"❌{p.get('label', '')}: ${amt:.0f}")
-    return "\n".join(out).strip()
+            out.append(f"❌{e(str(p.get('label', '')))}: ${to_float(p.get('amount')):.0f}")
+    return "\n".join(out)
 
 
 # ---------- SENDING ----------
 async def send_result(msg, result: dict, truck: str) -> None:
     kind = result.get("kind")
     if kind == "amazon" and result.get("amazon"):
+        a = result["amazon"]
+        dh = to_float(a.get("dh")) or None
+        stops = a.get("stops") or []
+        if dh is None and truck and stops:
+            first = stops[0]
+            dh = await miles_between(
+                truck, f"{first.get('street', '')}, {first.get('city', '')}"
+            )
         await msg.reply_text(
-            format_amazon(result["amazon"]), link_preview_options=NO_PREVIEW
+            format_amazon(a, dh),
+            parse_mode="HTML",
+            link_preview_options=NO_PREVIEW,
         )
         return
 
