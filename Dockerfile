@@ -1,6 +1,6 @@
 FROM python:3.12-slim
-WORKDIR /usr/src/app
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY dispatcher_bot.py .
+COPY . .
 CMD ["python", "dispatcher_bot.py"]
