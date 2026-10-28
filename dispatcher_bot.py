@@ -221,7 +221,7 @@ Rules:
 - address_line1: street only
 - address_line2: city, state, zip
 - date: always format as MM/DD/YYYY with a 4-digit year
-- time: copy exactly as shown in the document (e.g. "0900" or "0900-1100")
+- time: copy the appointment/arrival time EXACTLY as written in the document for that specific stop, character for character, including ranges, AM/PM and timezone (e.g. "7PM", "0900-1100", "09:00 - 11:00 CST"). Do NOT reformat, convert, round or shorten it. Look carefully in the whole document (stop details, appointment, window, schedule tables) for each stop's time; every stop, including deliveries, normally has one. Leave it empty ONLY if the document truly shows no time for that stop.
 - instruction/commodity: empty string if not shown in the document
 - vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
@@ -322,40 +322,86 @@ def build_message(load_data, empty_miles, loaded_miles):
     return "\n".join(lines)
 
 
+async def _routes_api_miles(http, origin, destination):
+    r = await http.post(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        headers={
+            "X-Goog-Api-Key": GOOGLE_MAPS_KEY or "",
+            "X-Goog-FieldMask": "routes.distanceMeters",
+            "Content-Type": "application/json",
+        },
+        json={
+            "origin": {"address": origin},
+            "destination": {"address": destination},
+            "travelMode": "DRIVE",
+            "units": "IMPERIAL",
+        },
+    )
+    data = r.json()
+    if r.status_code != 200:
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        raise RuntimeError("Routes API %s: %s" % (r.status_code, err.get("message", r.text[:200])))
+    routes = data.get("routes") or []
+    if not routes:
+        raise RuntimeError("Routes API: yo'nalish topilmadi")
+    return round(routes[0]["distanceMeters"] / 1609.344)
+
+
+async def _distance_matrix_miles(http, origin, destination):
+    r = await http.get(
+        "https://maps.googleapis.com/maps/api/distancematrix/json",
+        params={
+            "origins": origin,
+            "destinations": destination,
+            "units": "imperial",
+            "key": GOOGLE_MAPS_KEY,
+        },
+    )
+    data = r.json()
+    if data.get("status") != "OK":
+        raise RuntimeError("Distance Matrix %s: %s" % (data.get("status"), data.get("error_message", "")))
+    element = data["rows"][0]["elements"][0]
+    if element.get("status") != "OK":
+        raise RuntimeError("Distance Matrix element: %s" % element.get("status"))
+    return round(element["distance"]["value"] / 1609.344)
+
+
 async def get_distance_miles(origin, destination):
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    params = {
-        "origins": origin,
-        "destinations": destination,
-        "units": "imperial",
-        "key": GOOGLE_MAPS_KEY,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as http:
-            r = await http.get(url, params=params)
-        data = r.json()
-        element = data["rows"][0]["elements"][0]
-        if element["status"] != "OK":
-            return 0
-        return round(element["distance"]["value"] / 1609.344)
-    except Exception:
-        logger.exception("Distance Matrix error")
-        return 0
+    """Returns (miles, error). error is None on success."""
+    if not GOOGLE_MAPS_KEY:
+        return 0, "GOOGLE_MAPS_KEY secret o'rnatilmagan"
+    errors = []
+    async with httpx.AsyncClient(timeout=15) as http:
+        for fn in (_routes_api_miles, _distance_matrix_miles):
+            try:
+                return await fn(http, origin, destination), None
+            except Exception as e:
+                errors.append(str(e))
+                logger.warning("Distance error (%s -> %s): %s", origin, destination, e)
+    return 0, " | ".join(errors)
 
 
 async def calculate_miles(current_location, load_data):
+    """Returns (empty, loaded, errors)."""
     all_stops = []
     for pu in load_data.get("pickups", []):
         all_stops.append(pu.get("address_line1", "") + ", " + pu.get("address_line2", ""))
     for do_ in load_data.get("deliveries", []):
         all_stops.append(do_.get("address_line1", "") + ", " + do_.get("address_line2", ""))
     if not all_stops:
-        return 0, 0
-    # barcha so'rovlar bir vaqtda (tezroq)
+        return 0, 0, []
     tasks = [get_distance_miles(current_location, all_stops[0])]
     tasks += [get_distance_miles(all_stops[i], all_stops[i + 1]) for i in range(len(all_stops) - 1)]
     results = await asyncio.gather(*tasks)
-    return results[0], sum(results[1:])
+    errors = [err for _, err in results if err]
+    empty = results[0][0]
+    loaded = sum(m for m, _ in results[1:])
+    return empty, loaded, errors
+
+
+async def _warn_if_errors(message, errors):
+    if errors:
+        await message.reply_text("⚠️ Mil to'liq hisoblanmadi:\n" + errors[0][:300])
 
 
 def _read_docx(file_bytes):
@@ -483,9 +529,10 @@ async def receive_location(update, context):
     load_data = context.user_data.get("load_data", {})
     await update.message.reply_text("🗺 Calculating miles...")
     try:
-        empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
+        empty_miles, loaded_miles, errors = await calculate_miles(current_location, load_data)
         final_message = build_message(load_data, empty_miles, loaded_miles)
         await update.message.reply_text(final_message, parse_mode="HTML")
+        await _warn_if_errors(update.message, errors)
         context.user_data["current_location"] = current_location
         context.user_data["empty_miles"] = empty_miles
         context.user_data["loaded_miles"] = loaded_miles
@@ -544,9 +591,10 @@ async def chat_fallback(update, context):
 
                 if _addresses_changed(load_data, updated_data) and context.user_data.get("current_location"):
                     await update.message.reply_text("🗺 Address changed — recalculating miles...")
-                    empty_miles, loaded_miles = await calculate_miles(
+                    empty_miles, loaded_miles, errors = await calculate_miles(
                         context.user_data["current_location"], updated_data
                     )
+                    await _warn_if_errors(update.message, errors)
                     context.user_data["empty_miles"] = empty_miles
                     context.user_data["loaded_miles"] = loaded_miles
                 else:
