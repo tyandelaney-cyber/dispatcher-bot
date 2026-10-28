@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import html
 import asyncio
+import time
 import random
 import httpx
 from google import genai
@@ -22,15 +23,21 @@ AUTH_FILE = os.environ.get("AUTH_FILE", "authorized_users.json")
 WAITING_LOCATION = 1
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_KEY)
-MODEL_NAME = "gemini-3.1-flash-lite"
+GEMINI_TIMEOUT = 60  # seconds per request
+client = genai.Client(
+    api_key=GEMINI_KEY,
+    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT * 1000),
+)
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite")
 model = MODEL_NAME
 chat_model = MODEL_NAME
 
-MAX_RETRIES = 5
-BASE_DELAY = 5  # seconds
+MAX_RETRIES = 3
+BASE_DELAY = 3  # seconds
 
 # --- Authentication -------------------------------------------------------
 def _load_authorized():
@@ -119,22 +126,34 @@ def _extract_retry_delay(exc):
 async def generate_with_retry(model_name, contents):
     last_exc = None
     for attempt in range(MAX_RETRIES):
+        t0 = time.monotonic()
+        logger.info("Gemini call start (model=%s, attempt %s/%s)", model_name, attempt + 1, MAX_RETRIES)
         try:
-            return await asyncio.to_thread(
-                client.models.generate_content, model=model_name, contents=contents
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content, model=model_name, contents=contents
+                ),
+                timeout=GEMINI_TIMEOUT + 15,
             )
+            logger.info("Gemini call done in %.1fs", time.monotonic() - t0)
+            return resp
+        except asyncio.TimeoutError as e:
+            last_exc = e
+            logger.warning("Gemini call timed out after %.0fs (attempt %s/%s)",
+                           time.monotonic() - t0, attempt + 1, MAX_RETRIES)
+            continue
         except Exception as e:
             last_exc = e
+            logger.warning("Gemini error after %.1fs: %s", time.monotonic() - t0, str(e)[:300])
             if not _is_rate_limit_error(e):
                 raise
             suggested = _extract_retry_delay(e)
             delay = suggested if suggested is not None else BASE_DELAY * (2 ** attempt)
-            delay = delay + random.uniform(0, 1)
-            logger.warning(
-                "Gemini rate-limited/unavailable (attempt %s/%s), retrying in %.1fs",
-                attempt + 1, MAX_RETRIES, delay,
-            )
+            delay = min(delay, 20) + random.uniform(0, 1)
+            logger.warning("Retrying in %.1fs", delay)
             await asyncio.sleep(delay)
+    if isinstance(last_exc, asyncio.TimeoutError):
+        raise RuntimeError("Gemini javob bermadi (timeout). Birozdan keyin qayta yuboring.")
     raise last_exc
 
 
