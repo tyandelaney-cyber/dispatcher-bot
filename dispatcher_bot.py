@@ -202,7 +202,7 @@ Rules:
 - address_line1: street only
 - address_line2: city, state, zip
 - date: always format as MM/DD/YYYY with a 4-digit year
-- time: always colon-formatted 24h, e.g. "16:00-16:00" (never "1600 1600")
+- time: copy exactly as shown in the document (e.g. "0900" or "0900-1100")
 - instruction/commodity: empty string if not shown in the document
 - vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
 - Return ONLY the JSON, nothing else"""
@@ -256,14 +256,12 @@ def _ref_lines(stop):
 def _stop_block(lines, stop, header):
     lines.append("")
     lines.append(header)
-    lines.append("")
     if stop.get("facility"):
         lines.append(_esc(stop["facility"]))
     if stop.get("address_line1"):
         lines.append(_esc(stop["address_line1"]))
     if stop.get("address_line2"):
         lines.append(_esc(stop["address_line2"]))
-    lines.append("")
     lines.append(f"📅Date: {_esc(stop.get('date', ''))}")
     lines.append(f"🕔Time : {_esc(stop.get('time', ''))}")
     code_lines = []
@@ -293,7 +291,7 @@ def build_message(load_data, empty_miles, loaded_miles):
     lines.append(f"Loaded :  {loaded_miles} mile")
 
     lines.append("")
-    lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
+    lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER, TRAILER REGISTRATION PAPER, TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
     lines.append("DO NOT DEPART WITHOUT CONFIRMATION!!!")
     lines.append("")
     lines.append("❌LATE PICKUP $500 DEDUCTION!!!")
