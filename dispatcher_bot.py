@@ -1,532 +1,599 @@
+import os
 import io
+import re
 import json
 import logging
-import os
-import re
-import unicodedata
-from html import escape as _escape
-
+import mimetypes
+import html
+import asyncio
+import random
 import httpx
-from docx import Document
 from google import genai
 from google.genai import types
-from openpyxl import load_workbook
-from telegram import LinkPreviewOptions, Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, filters
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("dispatcher-bot")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
+GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY")
+BOT_PASSWORD = os.environ.get("BOT_PASSWORD")  # Fly.io Secrets
+AUTH_FILE = os.environ.get("AUTH_FILE", "authorized_users.json")
 
-def escape(s: str) -> str:
-    return _escape(s, quote=False)
+WAITING_LOCATION = 1
 
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------- CONFIG (Fly.io -> Secrets) ----------
-MISSING: list[str] = []
+client = genai.Client(api_key=GEMINI_KEY)
+MODEL_NAME = "gemini-3.1-flash-lite"
+model = MODEL_NAME
+chat_model = MODEL_NAME
 
+MAX_RETRIES = 5
+BASE_DELAY = 5  # seconds
 
-def env(*names: str, required: bool = True, default: str = "") -> str:
-    """Birinchi topilgan nomni oladi, bo'sh joylarni olib tashlaydi."""
-    for n in names:
-        v = os.environ.get(n, "").strip()
-        if v:
-            return v
-    if required:
-        MISSING.append(names[0])
-    return default
-
-
-BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN")
-GEMINI_API_KEY = env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-MAPS_API_KEY = env("GOOGLE_MAPS_API_KEY", "MAPS_API_KEY")
-BOT_PASSWORD = env("BOT_PASSWORD")
-GEMINI_MODEL = env("GEMINI_MODEL", required=False, default="gemini-2.5-flash")
-CARRIER_NAME = env("CARRIER_NAME", required=False, default="Al Amin Express Inc")
-DEFAULT_LOCATION = env("DEFAULT_LOCATION", required=False)
-AUTH_FILE = env("AUTH_FILE", required=False, default="auth.json")
-
-if MISSING:
-    seen = sorted(
-        k
-        for k in os.environ
-        if not k.startswith(("FLY_", "PYTHON", "LANG", "GPG", "PATH", "HOME", "PWD"))
-    )
-    raise SystemExit(f"YETISHMAYAPTI: {MISSING} | MAVJUD NOMLAR: {seen}")
-
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-
-PROMPT = """You read a freight load document (broker rate confirmation, Amazon Relay load,
-screenshot, or pasted text). First decide "kind":
-- "amazon": an Amazon Relay trip (Trip ID or Map ID, facility codes like CLT2 or POLY_PAK_07105_272,
-  stop types such as Preloaded, Drop, Live, Loaded - Live, Empty - Drop).
-- "regular": any other broker rate confirmation.
-
-Return ONLY JSON in this shape (fill the matching object, the other one is null):
-{
-  "kind": "regular" or "amazon",
-  "regular": {
-    "broker": "broker company name",
-    "load": "load / reference number",
-    "pickups": [ STOP, ... ],
-    "deliveries": [ STOP, ... ],
-    "warnings": ["every penalty, deduction or mandatory requirement stated in the document,
-                  one short UPPERCASE line each, keep dollar amounts and the word DEDUCTION"]
-  },
-  "amazon": {
-    "id_label": "MAP" or "TRIP",
-    "id": "map id or trip id",
-    "stops": [ {"stop_id": "the id printed after the stop number, e.g. 1129LLGC6",
-                "type": "e.g. Loaded - Drop", "date": "as written, e.g. Sun, Oct 12, 06:37 PM EDT",
-                "name": "facility code/name, e.g. BOS3", "street": "street", "city": "City, ST ZIP"} ],
-    "miles": trip miles as number or 0,
-    "dh": deadhead miles as number or 0,
-    "duration": "e.g. 15H 45M or empty",
-    "penalties": [ {"label": "Late PU", "amount": 1000} ]
-  }
-}
-STOP = {"name": "facility name", "street": "street", "city": "city", "state": "2-letter state",
-        "zip": "zip", "date": "MM/DD/YYYY", "time": "HHMM 24h without colon, or HHMM-HHMM window, or empty",
-        "instruction": "DROP / LIVE / etc, or empty", "commodity": "or empty",
-        "pu_number": "pickup number or empty", "bol": "BOL number or empty"}
-Rules: use empty string when data is missing. Never invent values."""
-
-
-# ---------- AUTH ----------
-def load_auth() -> set[int]:
+# --- Authentication -------------------------------------------------------
+def _load_authorized():
     try:
-        with open(AUTH_FILE) as f:
+        with open(AUTH_FILE, "r") as f:
             return set(json.load(f))
     except Exception:
         return set()
 
 
-def save_auth(ids: set[int]) -> None:
+def _save_authorized():
     try:
         with open(AUTH_FILE, "w") as f:
-            json.dump(sorted(ids), f)
-    except Exception as exc:
-        log.warning("auth save failed: %s", exc)
+            json.dump(sorted(AUTHORIZED_USERS), f)
+    except Exception:
+        logger.warning("Could not save authorized users file")
 
 
-AUTHORIZED = load_auth()
+AUTHORIZED_USERS = _load_authorized()
 
 
-async def gate(update: Update) -> bool:
-    """True if user may use the bot. First message = password."""
-    uid = update.effective_user.id
-    if uid in AUTHORIZED:
-        return True
-    text = (update.message.text or "").strip() if update.message else ""
-    if text and text == BOT_PASSWORD:
-        AUTHORIZED.add(uid)
-        save_auth(AUTHORIZED)
+def is_authorized(user_id):
+    return user_id in AUTHORIZED_USERS
+
+
+async def request_password(update):
+    await update.message.reply_text("🔒 Bu bot himoyalangan.\nIltimos, parolni kiriting:")
+
+
+async def handle_password_attempt(update, context):
+    if not update.message:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        await request_password(update)
+        return
+    if BOT_PASSWORD and text == BOT_PASSWORD:
+        AUTHORIZED_USERS.add(update.effective_user.id)
+        _save_authorized()
+        # parol chatda qolmasligi uchun xabarni o'chiramiz
         try:
             await update.message.delete()
         except Exception:
             pass
-        await update.effective_chat.send_message("✅ Parol to'g'ri. Rate confirmation yuboring.")
-        return False
-    await update.effective_chat.send_message("🔒 Parolni kiriting.")
-    return False
-
-
-# ---------- FILE READING + GEMINI ----------
-def docx_text(data: bytes) -> str:
-    doc = Document(io.BytesIO(data))
-    lines = [p.text for p in doc.paragraphs if p.text.strip()]
-    for t in doc.tables:
-        for row in t.rows:
-            lines.append(" | ".join(c.text.strip() for c in row.cells))
-    return "\n".join(lines)
-
-
-def xlsx_text(data: bytes) -> str:
-    wb = load_workbook(io.BytesIO(data), data_only=True)
-    lines = []
-    for ws in wb.worksheets:
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None]
-            if cells:
-                lines.append(" | ".join(cells))
-    return "\n".join(lines)
-
-
-def gemini_json(contents: list) -> dict:
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json", temperature=0
-        ),
-    )
-    return json.loads(resp.text)
-
-
-def extract_file(data: bytes, mime: str, filename: str = "") -> dict:
-    name = filename.lower()
-    if name.endswith(".docx"):
-        contents = [PROMPT, docx_text(data)]
-    elif name.endswith((".xlsx", ".xlsm")):
-        contents = [PROMPT, xlsx_text(data)]
-    else:
-        contents = [PROMPT, types.Part.from_bytes(data=data, mime_type=mime)]
-    return gemini_json(contents)
-
-
-def extract_text(text: str) -> dict:
-    return gemini_json([PROMPT, text])
-
-
-# ---------- MAPS (Routes API) ----------
-async def miles_between(origin: str, dest: str) -> float | None:
-    """Driving miles via Google Routes API."""
-    if not origin or not dest:
-        return None
-    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
-    headers = {
-        "X-Goog-Api-Key": MAPS_API_KEY,
-        "X-Goog-FieldMask": "routes.distanceMeters",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "origin": {"address": origin},
-        "destination": {"address": dest},
-        "travelMode": "DRIVE",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20) as http:
-            r = await http.post(url, headers=headers, json=body)
-        meters = r.json()["routes"][0]["distanceMeters"]
-        return meters / 1609.344
-    except Exception as exc:
-        log.warning("maps failed: %s", exc)
-        return None
-
-
-async def chain_miles(addrs: list[str]) -> float | None:
-    if len(addrs) < 2:
-        return None
-    total = 0.0
-    for a, b in zip(addrs, addrs[1:]):
-        m = await miles_between(a, b)
-        if m is None:
-            return None
-        total += m
-    return total
-
-
-def full_address(s: dict) -> str:
-    tail = " ".join(x for x in [s.get("state", ""), s.get("zip", "")] if x)
-    return ", ".join(x for x in [s.get("street", ""), s.get("city", ""), tail] if x)
-
-
-# ---------- REGULAR DISPATCH FORMAT ----------
-def city_line(s: dict) -> str:
-    parts = [
-        str(s.get("city", "")).upper(),
-        str(s.get("state", "")).upper(),
-        str(s.get("zip", "")),
-    ]
-    return ", ".join(p for p in parts if p)
-
-
-def reg_stop(head: str, s: dict, pu: bool = False) -> str:
-    e = escape
-    lines = [head]
-    for v in (s.get("name"), s.get("street"), city_line(s)):
-        if v:
-            lines.append(e(str(v)))
-    if s.get("date"):
-        lines.append(f"📅Date: {e(str(s['date']))}")
-    if s.get("time"):
-        lines.append(f"🕔Time : {e(str(s['time']))}")
-    if s.get("instruction"):
-        lines.append(f"<code>🚛 Instruction:{e(str(s['instruction']).upper())}</code>")
-    if s.get("commodity"):
-        lines.append(f"<code>📤Commodity: {e(str(s['commodity']))}</code>")
-    if pu and s.get("pu_number"):
-        lines.append(f"<code>❕PU#: {e(str(s['pu_number']))}</code>")
-    if s.get("bol"):
-        lines.append(f"<code>❕BOL# {e(str(s['bol']))}</code>")
-    return "\n".join(lines)
-
-
-def format_regular(r: dict, empty_miles: float | None, loaded_miles: float | None) -> str:
-    e = escape
-    parts = [
-        f"📌Broker: {e(str(r.get('broker', '')))}\n"
-        f"{e(CARRIER_NAME)}\n"
-        f"Load: {e(str(r.get('load', '')))}"
-    ]
-    for i, s in enumerate(r.get("pickups") or [], 1):
-        parts.append(reg_stop(f"🟢PU {i} :", s, pu=True))
-    for i, s in enumerate(r.get("deliveries") or [], 1):
-        parts.append(reg_stop(f"🔴DO {i}:", s))
-    em = f"{round(empty_miles)}" if empty_miles is not None else "—"
-    lm = f"{round(loaded_miles)}" if loaded_miles is not None else "—"
-    parts.append(f"Empty : {em} mile\nLoaded : {lm} mile")
-    for w in r.get("warnings") or []:
-        parts.append("❌" + e(str(w).strip()))
-    return "\n\n".join(parts)
-
-
-# ---------- AMAZON FORMAT ----------
-SEP = "—————————————"
-
-
-def norm(text: str) -> str:
-    """Qalin unicode harflarni (𝗥𝗮𝘁𝗲) oddiy ASCII ga aylantiradi."""
-    return unicodedata.normalize("NFKC", text)
-
-
-ID_RE = re.compile(r"(TRIP|MAP)\s*ID\s*:\s*(\S+)", re.I)
-SEP_RE = re.compile(r"^[—–\-_=]{3,}$")
-SUMMARY_START = ("🚛", "🕒", "💰", "💵", "❌")
-
-
-def is_amazon_text(text: str) -> bool:
-    t = norm(text)
-    return bool(ID_RE.search(t)) and "📍" in t
-
-
-def parse_stop(chunk: str) -> dict | None:
-    lines = [ln.strip() for ln in chunk.splitlines()]
-    head = re.match(r"📍\s*(\d+)#:\s*(.*)", lines[0]) if lines else None
-    if not head:
-        return None
-    body = []
-    for ln in lines[1:]:
-        if not ln:
-            continue
-        if SEP_RE.match(ln) or ln.startswith(SUMMARY_START):
-            break
-        body.append(ln)
-
-    date, rest = "", []
-    for ln in body:
-        if ln.startswith("📅") or re.search(r"\d{1,2}:\d{2}", ln):
-            date = re.sub(r"^📅\s*(Date:)?\s*", "", ln).strip()
-        else:
-            rest.append(ln)
-
-    if len(rest) < 3:
-        return None
-    typ = rest[0] if len(rest) >= 4 else ""
-    core = rest[1:] if len(rest) >= 4 else rest
-    return {
-        "stop_id": head.group(2).strip(),
-        "type": typ,
-        "date": date,
-        "name": core[0],
-        "street": ", ".join(core[1:-1]),
-        "city": core[-1],
-    }
-
-
-def parse_amazon_text(raw: str) -> dict:
-    text = norm(raw)
-
-    def g(pattern: str, default: str = "") -> str:
-        m = re.search(pattern, text, re.I)
-        return m.group(1).strip() if m else default
-
-    def num(s: str) -> float:
-        try:
-            return float(s.replace(",", ""))
-        except ValueError:
-            return 0.0
-
-    stops = []
-    for chunk in re.split(r"(?=📍\s*\d+#:)", text):
-        chunk = chunk.lstrip()
-        if chunk.startswith("📍"):
-            st = parse_stop(chunk)
-            if st:
-                stops.append(st)
-
-    idm = ID_RE.search(text)
-    return {
-        "id_label": idm.group(1).upper() if idm else "TRIP",
-        "id": idm.group(2) if idm else "",
-        "stops": stops,
-        "miles": num(g(r"Trip:\s*([\d,\.]+)\s*mi")),
-        "dh": num(g(r"DH:\s*([\d,\.]+)")),
-        "duration": g(r"Duration:\s*(.+)"),
-        "penalties": [
-            {"label": k, "amount": v}
-            for k, v in re.findall(r"❌\s*(.+?):\s*\$([\d,]+)", text)
-        ],
-    }
-
-
-def to_float(v) -> float:
-    try:
-        return float(str(v).replace(",", "").replace("$", ""))
-    except ValueError:
-        return 0.0
-
-
-def format_amazon(a: dict, dh: float | None) -> str:
-    e = escape
-    ident = str(a.get("id", ""))
-    label = "Map" if str(a.get("id_label", "")).upper() == "MAP" else "Trip"
-    miles = to_float(a.get("miles"))
-
-    out = [f"🗺 <b>{label} ID :</b> {e(ident)}"]
-    for i, st in enumerate(a.get("stops") or [], 1):
-        out.append(f"📍{i}#: {e(str(st.get('stop_id') or ident))}")
-        for v in (st.get("type"), st.get("date"), st.get("name"), st.get("street"), st.get("city")):
-            if v:
-                out.append(e(str(v)))
-        out.append(SEP)
-
-    if miles:
-        out.append(f"🚛 <b>Trip:</b> {miles:,.0f}mi")
-    out.append(f"DH: {round(dh) if dh is not None else '—'}")
-    if a.get("duration"):
-        out.append(f"🕒 Duration: {e(str(a['duration']).upper())}")
-    pens = a.get("penalties") or []
-    if pens:
-        out.append("")
-        for p in pens:
-            out.append(f"❌{e(str(p.get('label', '')))}: ${to_float(p.get('amount')):.0f}")
-    return "\n".join(out)
-
-
-# ---------- SENDING ----------
-async def send_result(msg, result: dict, truck: str) -> None:
-    kind = result.get("kind")
-    if kind == "amazon" and result.get("amazon"):
-        a = result["amazon"]
-        dh = to_float(a.get("dh")) or None
-        stops = a.get("stops") or []
-        if dh is None and truck and stops:
-            first = stops[0]
-            dh = await miles_between(
-                truck, f"{first.get('street', '')}, {first.get('city', '')}"
-            )
-        await msg.reply_text(
-            format_amazon(a, dh),
-            parse_mode="HTML",
-            link_preview_options=NO_PREVIEW,
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Parol to'g'ri! Endi botdan foydalanishingiz mumkin.\n\n/start buyrug'ini yuboring.",
         )
-        return
-
-    r = result.get("regular") or {}
-    pickups = r.get("pickups") or []
-    deliveries = r.get("deliveries") or []
-    stops = [full_address(s) for s in pickups + deliveries]
-    loaded = await chain_miles(stops)
-    empty = None
-    if truck and pickups:
-        empty = await miles_between(truck, full_address(pickups[0]))
-    await msg.reply_text(
-        format_regular(r, empty, loaded),
-        parse_mode="HTML",
-        link_preview_options=NO_PREVIEW,
-    )
-
-
-# ---------- HANDLERS ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await gate(update):
-        return
-    await update.message.reply_text(
-        "Rate confirmation yuboring (PDF, rasm, Word, Excel) yoki matnini tashlang.\n"
-        "Truck joylashuvi: /loc Atlanta, GA"
-    )
-
-
-async def set_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in AUTHORIZED:
-        await update.message.reply_text("🔒 Parolni kiriting.")
-        return
-    loc = " ".join(context.args).strip()
-    if not loc:
-        cur = context.user_data.get("loc") or DEFAULT_LOCATION or "yo'q"
-        await update.message.reply_text(f"Hozirgi joylashuv: {cur}\nO'zgartirish: /loc City, ST")
-        return
-    context.user_data["loc"] = loc
-    await update.message.reply_text(f"📍 Joylashuv: {loc}")
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await gate(update):
-        return
-    msg = update.message
-    text = msg.text or ""
-    truck = context.user_data.get("loc") or DEFAULT_LOCATION
-
-    try:
-        if is_amazon_text(text):
-            a = parse_amazon_text(text)
-            if not a["stops"]:
-                raise ValueError("stop'lar topilmadi, matnni to'liq tashlang")
-            await send_result(msg, {"kind": "amazon", "amazon": a}, truck)
-        elif len(text.strip()) >= 80:
-            status = await msg.reply_text("⏳ O'qilyapti...")
-            try:
-                result = extract_text(text)
-                await send_result(msg, result, truck)
-            finally:
-                try:
-                    await status.delete()
-                except Exception:
-                    pass
-        else:
-            await msg.reply_text("Rate confirmation fayl/rasm yuboring yoki yuk matnini tashlang.")
-    except Exception as exc:
-        log.exception("text processing failed")
-        await msg.reply_text(f"❌ Xatolik: {exc}")
-
-
-async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in AUTHORIZED:
-        await update.message.reply_text("🔒 Parolni kiriting.")
-        return
-
-    msg = update.message
-    if msg.photo:
-        tg_file = await msg.photo[-1].get_file()
-        mime, filename = "image/jpeg", "photo.jpg"
-    elif msg.document:
-        tg_file = await msg.document.get_file()
-        mime = msg.document.mime_type or "application/pdf"
-        filename = msg.document.file_name or ""
     else:
+        await update.message.reply_text("❌ Parol noto'g'ri. Qayta urinib ko'ring:")
+
+
+def require_auth(handler_func):
+    async def wrapped(update, context, *args, **kwargs):
+        user = update.effective_user
+        if user is None or not is_authorized(user.id):
+            await handle_password_attempt(update, context)
+            return ConversationHandler.END
+        return await handler_func(update, context, *args, **kwargs)
+    return wrapped
+
+# ---------------------------------------------------------------------------
+
+
+def _is_rate_limit_error(exc):
+    msg = str(exc)
+    return (
+        "429" in msg
+        or "503" in msg
+        or "UNAVAILABLE" in msg
+        or "quota" in msg.lower()
+        or ("rate" in msg.lower() and "limit" in msg.lower())
+    )
+
+
+def _extract_retry_delay(exc):
+    match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(exc))
+    if match:
+        return int(match.group(1))
+    match = re.search(r"retry in ([\d.]+)s", str(exc), re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+async def generate_with_retry(model_name, contents):
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await asyncio.to_thread(
+                client.models.generate_content, model=model_name, contents=contents
+            )
+        except Exception as e:
+            last_exc = e
+            if not _is_rate_limit_error(e):
+                raise
+            suggested = _extract_retry_delay(e)
+            delay = suggested if suggested is not None else BASE_DELAY * (2 ** attempt)
+            delay = delay + random.uniform(0, 1)
+            logger.warning(
+                "Gemini rate-limited/unavailable (attempt %s/%s), retrying in %.1fs",
+                attempt + 1, MAX_RETRIES, delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc
+
+
+def parse_json_response(text):
+    raw = (text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"```$", "", raw).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
+EXTRACT_PROMPT = """You are a freight dispatcher assistant.
+Analyze this load/rate confirmation and return ONLY a valid JSON object, no explanation, no markdown, no backticks.
+JSON format:
+{
+  "broker": "broker company name only",
+  "load_number": "load number",
+  "equipment": "equipment type",
+  "weight": "total weight with unit",
+  "rate": "total rate e.g. $2,500.00",
+  "rate_per_mile": "rate per mile e.g. $3.38/mile or empty string",
+  "pickups": [
+    {
+      "number": 1,
+      "facility": "facility name or empty string",
+      "address_line1": "street address only e.g. 14901 N Beach St",
+      "address_line2": "city, state, zip e.g. Fort Worth, TX, 76177",
+      "date": "MM/DD/YYYY",
+      "time": "time or ASAP",
+      "instruction": "LIVE LOAD or DROP or empty",
+      "commodity": "commodity description or empty",
+      "vrid": "VRID number if shown in document, else empty string",
+      "pu_number": "PU number/reference if shown in document, else empty string",
+      "bol": "BOL number if shown in document, else empty string",
+      "appt": "appointment number/confirmation number if shown in document, else empty string",
+      "po": "PO number if shown in document, else empty string"
+    }
+  ],
+  "deliveries": [
+    {
+      "number": 1,
+      "facility": "facility name or empty string",
+      "address_line1": "street address only e.g. 124 Davis St",
+      "address_line2": "city, state, zip e.g. Portland, TN, 37148",
+      "date": "MM/DD/YYYY",
+      "time": "time or ASAP",
+      "instruction": "LIVE UNLOAD or DROP or empty",
+      "commodity": "commodity description or empty",
+      "vrid": "VRID number if shown in document, else empty string",
+      "pu_number": "PU number/reference if shown in document, else empty string",
+      "bol": "BOL number if shown in document, else empty string",
+      "appt": "appointment number/confirmation number if shown in document, else empty string",
+      "po": "PO number if shown in document, else empty string"
+    }
+  ]
+}
+Rules:
+- Include ALL pickup and delivery stops
+- facility: location name/code
+- address_line1: street only
+- address_line2: city, state, zip
+- date: always format as MM/DD/YYYY with a 4-digit year
+- time: always colon-formatted 24h, e.g. "16:00-16:00" (never "1600 1600")
+- instruction/commodity: empty string if not shown in the document
+- vrid/pu_number/bol/appt/po: only fill in if explicitly shown in the document for that specific stop; otherwise return an empty string. Do not guess or invent values.
+- Return ONLY the JSON, nothing else"""
+
+EDIT_PROMPT = """You are a freight dispatcher assistant helping edit load data.
+Below is the CURRENT load data as JSON, followed by an instruction from the dispatcher
+asking to change something about it (e.g. "change DO time to 3:00 PM", "PU 1 sanasini ertaga qo'y").
+
+Decide:
+1. If the dispatcher's message is clearly asking to CHANGE/EDIT/UPDATE/CORRECT something in the load data
+   (times, dates, addresses, facility names, broker, load number, equipment, weight, rate, instructions,
+   commodity, VRID/PU#/BOL#/Appt#/PO#, etc.), apply the change(s) to the JSON and return ONLY the updated
+   JSON object, with the EXACT same structure/fields as the input, no explanation, no markdown, no backticks.
+2. If the message is NOT an edit request (it's a question, comment, or unrelated chat), return ONLY this
+   exact JSON: {{"__not_an_edit__": true}}
+
+Only change the field(s) the dispatcher actually asked about. Keep every other field exactly as it was.
+If the dispatcher refers to "DO" they mean a delivery stop; "PU" means a pickup stop. If they don't specify
+a stop number and there is only one pickup or one delivery, apply it to that one. If there are multiple and
+it's ambiguous which one, make your best reasonable guess based on the message.
+
+CURRENT LOAD DATA:
+{load_data}
+
+DISPATCHER MESSAGE:
+{user_text}
+
+Return ONLY the JSON object described above, nothing else."""
+
+
+def get_mime(filename):
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
+
+
+def _esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def _ref_lines(stop):
+    fields = [
+        ("VRID#", stop.get("vrid", "")),
+        ("PU#:", stop.get("pu_number", "")),
+        ("BOL#", stop.get("bol", "")),
+        ("Appt#", stop.get("appt", "")),
+        ("PO#", stop.get("po", "")),
+    ]
+    return [f"❕{label} {_esc(value)}" for label, value in fields if value]
+
+
+def _stop_block(lines, stop, header):
+    lines.append("")
+    lines.append(header)
+    lines.append("")
+    if stop.get("facility"):
+        lines.append(_esc(stop["facility"]))
+    if stop.get("address_line1"):
+        lines.append(_esc(stop["address_line1"]))
+    if stop.get("address_line2"):
+        lines.append(_esc(stop["address_line2"]))
+    lines.append("")
+    lines.append(f"📅Date: {_esc(stop.get('date', ''))}")
+    lines.append(f"🕔Time : {_esc(stop.get('time', ''))}")
+    code_lines = []
+    if stop.get("instruction"):
+        code_lines.append(f"🚛 Instruction:{_esc(stop['instruction'])}")
+    if stop.get("commodity"):
+        code_lines.append(f"📤Commodity: {_esc(stop['commodity'])}")
+    code_lines.extend(_ref_lines(stop))
+    if code_lines:
+        lines.append(f"<code>{chr(10).join(code_lines)}</code>")
+
+
+def build_message(load_data, empty_miles, loaded_miles):
+    lines = []
+    lines.append(f"📌Broker:  {_esc(load_data.get('broker', ''))}")
+    lines.append("Al Amin Express Inc")
+    lines.append(f"Load:    {_esc(load_data.get('load_number', ''))}")
+
+    for pu in load_data.get("pickups", []):
+        _stop_block(lines, pu, f"🟢PU {pu.get('number', '')} :")
+
+    for do_ in load_data.get("deliveries", []):
+        _stop_block(lines, do_, f"🔴DO {do_.get('number', '')}:")
+
+    lines.append("")
+    lines.append(f"Empty :  {empty_miles} mile")
+    lines.append(f"Loaded :  {loaded_miles} mile")
+
+    lines.append("")
+    lines.append("❌MUST SEND TRAILER PICTURES, TRAILER REGISTRATION PAPER TO THE GROUP AND WAIT FOR THE GOOD TO GO CONFIRMATION BY THE ONLY DISPATCHER/UPDATER.")
+    lines.append("DO NOT DEPART WITHOUT CONFIRMATION!!!")
+    lines.append("")
+    lines.append("❌LATE PICKUP $500 DEDUCTION!!!")
+    lines.append("")
+    lines.append("❌LATE DELIVERY $700 DEDUCTION!!!")
+    lines.append("")
+    lines.append("❌MUST USE AMAZON RELAY")
+
+    return "\n".join(lines)
+
+
+async def get_distance_miles(origin, destination):
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": origin,
+        "destinations": destination,
+        "units": "imperial",
+        "key": GOOGLE_MAPS_KEY,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(url, params=params)
+        data = r.json()
+        element = data["rows"][0]["elements"][0]
+        if element["status"] != "OK":
+            return 0
+        return round(element["distance"]["value"] / 1609.344)
+    except Exception:
+        logger.exception("Distance Matrix error")
+        return 0
+
+
+async def calculate_miles(current_location, load_data):
+    all_stops = []
+    for pu in load_data.get("pickups", []):
+        all_stops.append(pu.get("address_line1", "") + ", " + pu.get("address_line2", ""))
+    for do_ in load_data.get("deliveries", []):
+        all_stops.append(do_.get("address_line1", "") + ", " + do_.get("address_line2", ""))
+    if not all_stops:
+        return 0, 0
+    # barcha so'rovlar bir vaqtda (tezroq)
+    tasks = [get_distance_miles(current_location, all_stops[0])]
+    tasks += [get_distance_miles(all_stops[i], all_stops[i + 1]) for i in range(len(all_stops) - 1)]
+    results = await asyncio.gather(*tasks)
+    return results[0], sum(results[1:])
+
+
+def _read_docx(file_bytes):
+    import docx as _docx
+    doc = _docx.Document(io.BytesIO(file_bytes))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            parts.append("\t".join(c.text.strip() for c in row.cells))
+    return "\n".join(parts)
+
+
+def _read_xlsx(file_bytes):
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    rows = []
+    for sheet in wb.worksheets:
+        rows.append("=== " + sheet.title + " ===")
+        for row in sheet.iter_rows(values_only=True):
+            rows.append("\t".join(str(c) if c is not None else "" for c in row))
+    return "\n".join(rows)
+
+
+async def extract_load_data(file_bytes, filename, caption=""):
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    mime = get_mime(filename)
+
+    if mime.startswith("image/"):
+        part = types.Part.from_bytes(data=file_bytes, mime_type=mime)
+        response = await generate_with_retry(model, [EXTRACT_PROMPT, part])
+    elif mime == "application/pdf" or ext == "pdf":
+        part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
+        response = await generate_with_retry(model, [EXTRACT_PROMPT, part])
+    elif ext == "docx":
+        try:
+            text = _read_docx(file_bytes)
+        except Exception as e:
+            text = "[Could not parse: " + str(e) + "]"
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nDocument content:\n" + text[:12000])
+    elif ext == "doc":
+        raise ValueError("Eski .doc format qo'llab-quvvatlanmaydi. Iltimos, .docx yoki PDF yuboring.")
+    elif ext in ("xlsx", "xlsm"):
+        try:
+            text = _read_xlsx(file_bytes)
+        except Exception as e:
+            text = "[Could not parse: " + str(e) + "]"
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nSpreadsheet content:\n" + text[:12000])
+    elif ext == "xls":
+        raise ValueError("Eski .xls format qo'llab-quvvatlanmaydi. Iltimos, .xlsx, CSV yoki PDF yuboring.")
+    elif ext == "csv":
+        text = file_bytes.decode("utf-8", errors="replace")[:12000]
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nSpreadsheet content:\n" + text)
+    else:
+        text = file_bytes.decode("utf-8", errors="replace")[:12000]
+        response = await generate_with_retry(model, EXTRACT_PROMPT + "\n\nFile content:\n" + text)
+
+    return parse_json_response(response.text)
+
+
+@require_auth
+async def start(update, context):
+    await update.message.reply_text(
+        "👋 Dispatcher Bot ready!\n\n"
+        "Send me a load confirmation (photo, PDF, Word, Excel) and I'll format it.\n"
+        "I'll also ask your current location to calculate empty & loaded miles.\n\n"
+        "/help for more info."
+    )
+    return ConversationHandler.END
+
+
+@require_auth
+async def help_cmd(update, context):
+    await update.message.reply_text(
+        "📌 Send any load/rate confirmation:\n"
+        "🖼 Photo / screenshot\n"
+        "📋 PDF\n"
+        "📄 Word (.docx)\n"
+        "📊 Excel (.xlsx) / CSV\n\n"
+        "The bot will:\n"
+        "1️⃣ Extract all load info\n"
+        "2️⃣ Ask your current location\n"
+        "3️⃣ Calculate empty & loaded miles\n"
+        "4️⃣ Send formatted dispatcher message\n\n"
+        "/cancel to cancel current operation"
+    )
+    return ConversationHandler.END
+
+
+@require_auth
+async def receive_file(update, context):
+    msg = update.message
+    caption = msg.caption or ""
+    await msg.reply_text("⏳ Reading document...")
+    try:
+        if msg.document:
+            f = await msg.document.get_file()
+            file_bytes = bytes(await f.download_as_bytearray())
+            filename = msg.document.file_name or "file"
+        else:
+            f = await msg.photo[-1].get_file()
+            file_bytes = bytes(await f.download_as_bytearray())
+            filename = "photo.jpg"
+
+        load_data = await extract_load_data(file_bytes, filename, caption)
+        context.user_data.clear()
+        context.user_data["load_data"] = load_data
+
+        pu_count = len(load_data.get("pickups", []))
+        do_count = len(load_data.get("deliveries", []))
+        await msg.reply_text(
+            "✅ Found: " + str(pu_count) + " pickup(s), " + str(do_count) + " delivery stop(s)\n\n"
+            "📍 What's your current location?\n"
+            "(Type city name or full address, e.g. 'Dallas, TX')"
+        )
+        return WAITING_LOCATION
+    except Exception as e:
+        logger.exception("File processing error")
+        await msg.reply_text("❌ Error reading file: " + str(e))
+        return ConversationHandler.END
+
+
+@require_auth
+async def receive_location(update, context):
+    current_location = update.message.text.strip()
+    load_data = context.user_data.get("load_data", {})
+    await update.message.reply_text("🗺 Calculating miles...")
+    try:
+        empty_miles, loaded_miles = await calculate_miles(current_location, load_data)
+        final_message = build_message(load_data, empty_miles, loaded_miles)
+        await update.message.reply_text(final_message, parse_mode="HTML")
+        context.user_data["current_location"] = current_location
+        context.user_data["empty_miles"] = empty_miles
+        context.user_data["loaded_miles"] = loaded_miles
+    except Exception as e:
+        logger.exception("Miles calculation error")
+        await update.message.reply_text("❌ Error: " + str(e))
+        context.user_data.clear()
+    return ConversationHandler.END
+
+
+@require_auth
+async def cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled. Send a new load document whenever you're ready.")
+    return ConversationHandler.END
+
+
+def _addresses_changed(old_data, new_data):
+    def addr_set(data):
+        addrs = []
+        for pu in data.get("pickups", []):
+            addrs.append((pu.get("address_line1", ""), pu.get("address_line2", "")))
+        for do_ in data.get("deliveries", []):
+            addrs.append((do_.get("address_line1", ""), do_.get("address_line2", "")))
+        return addrs
+    return addr_set(old_data) != addr_set(new_data)
+
+
+async def edit_load_data(load_data, user_text):
+    prompt = EDIT_PROMPT.format(
+        load_data=json.dumps(load_data, ensure_ascii=False),
+        user_text=user_text,
+    )
+    response = await generate_with_retry(model, prompt)
+    parsed = parse_json_response(response.text)
+    if isinstance(parsed, dict) and parsed.get("__not_an_edit__"):
+        return None, False
+    return parsed, True
+
+
+@require_auth
+async def chat_fallback(update, context):
+    if not update.message or not update.message.text:
+        return
+    user_text = update.message.text.strip()
+    if not user_text:
         return
 
-    status = await msg.reply_text("⏳ O'qilyapti...")
+    load_data = context.user_data.get("load_data")
+
     try:
-        data = bytes(await tg_file.download_as_bytearray())
-        result = extract_file(data, mime, filename)
-        truck = context.user_data.get("loc") or DEFAULT_LOCATION
-        await send_result(msg, result, truck)
-    except Exception as exc:
-        log.exception("processing failed")
-        await msg.reply_text(f"❌ Xatolik: {exc}")
-    finally:
-        try:
-            await status.delete()
-        except Exception:
-            pass
+        if load_data:
+            updated_data, was_edit = await edit_load_data(load_data, user_text)
+            if was_edit:
+                context.user_data["load_data"] = updated_data
+
+                if _addresses_changed(load_data, updated_data) and context.user_data.get("current_location"):
+                    await update.message.reply_text("🗺 Address changed — recalculating miles...")
+                    empty_miles, loaded_miles = await calculate_miles(
+                        context.user_data["current_location"], updated_data
+                    )
+                    context.user_data["empty_miles"] = empty_miles
+                    context.user_data["loaded_miles"] = loaded_miles
+                else:
+                    empty_miles = context.user_data.get("empty_miles", 0)
+                    loaded_miles = context.user_data.get("loaded_miles", 0)
+
+                final_message = build_message(updated_data, empty_miles, loaded_miles)
+                await update.message.reply_text("✅ Updated:")
+                await update.message.reply_text(final_message, parse_mode="HTML")
+                return
+
+            prompt = (
+                "You are a helpful assistant for a freight dispatcher. "
+                "The dispatcher is currently working on this load (JSON context):\n"
+                + json.dumps(load_data, ensure_ascii=False)
+                + "\n\nAnswer the dispatcher's question or message naturally and helpfully, "
+                "using the load context above when relevant:\n\n" + user_text
+            )
+        else:
+            prompt = (
+                "You are a helpful, friendly assistant chatting with a freight dispatcher. "
+                "Answer naturally and helpfully:\n\n" + user_text
+            )
+
+        response = await generate_with_retry(chat_model, prompt)
+        reply = response.text.strip() if response.text else "🤔 I couldn't come up with a response to that."
+        await update.message.reply_text(reply)
+    except Exception as e:
+        logger.exception("Chat fallback error")
+        await update.message.reply_text("❌ Error: " + str(e))
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    missing = [n for n, v in [
+        ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
+        ("GEMINI_KEY", GEMINI_KEY),
+        ("GOOGLE_MAPS_KEY", GOOGLE_MAPS_KEY),
+        ("BOT_PASSWORD", BOT_PASSWORD),
+    ] if not v]
+    if missing:
+        logger.error("Missing Fly.io secrets: %s", ", ".join(missing))
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN secret is not set")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Document.ALL, receive_file),
+            MessageHandler(filters.PHOTO, receive_file),
+        ],
+        states={
+            WAITING_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_location)]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
+    )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("loc", set_loc))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_fallback))
+    logger.info("✅ Bot running…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
