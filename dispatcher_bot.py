@@ -36,7 +36,12 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite")
 model = MODEL_NAME
 chat_model = MODEL_NAME
 
-MAX_RETRIES = 3
+FALLBACK_MODELS = [
+    m.strip() for m in os.environ.get(
+        "FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite"
+    ).split(",") if m.strip()
+]
+MAX_RETRIES = 2  # per model
 BASE_DELAY = 3  # seconds
 
 # --- Authentication -------------------------------------------------------
@@ -124,37 +129,40 @@ def _extract_retry_delay(exc):
 
 
 async def generate_with_retry(model_name, contents):
+    """Tries the primary model, then fallback models if it is overloaded/unavailable."""
+    candidates = [model_name] + [m for m in FALLBACK_MODELS if m != model_name]
     last_exc = None
-    for attempt in range(MAX_RETRIES):
-        t0 = time.monotonic()
-        logger.info("Gemini call start (model=%s, attempt %s/%s)", model_name, attempt + 1, MAX_RETRIES)
-        try:
-            resp = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.models.generate_content, model=model_name, contents=contents
-                ),
-                timeout=GEMINI_TIMEOUT + 15,
-            )
-            logger.info("Gemini call done in %.1fs", time.monotonic() - t0)
-            return resp
-        except asyncio.TimeoutError as e:
-            last_exc = e
-            logger.warning("Gemini call timed out after %.0fs (attempt %s/%s)",
-                           time.monotonic() - t0, attempt + 1, MAX_RETRIES)
-            continue
-        except Exception as e:
-            last_exc = e
-            logger.warning("Gemini error after %.1fs: %s", time.monotonic() - t0, str(e)[:300])
-            if not _is_rate_limit_error(e):
-                raise
-            suggested = _extract_retry_delay(e)
-            delay = suggested if suggested is not None else BASE_DELAY * (2 ** attempt)
-            delay = min(delay, 20) + random.uniform(0, 1)
-            logger.warning("Retrying in %.1fs", delay)
-            await asyncio.sleep(delay)
-    if isinstance(last_exc, asyncio.TimeoutError):
-        raise RuntimeError("Gemini javob bermadi (timeout). Birozdan keyin qayta yuboring.")
-    raise last_exc
+    for current in candidates:
+        for attempt in range(MAX_RETRIES):
+            t0 = time.monotonic()
+            logger.info("Gemini call start (model=%s, attempt %s/%s)", current, attempt + 1, MAX_RETRIES)
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content, model=current, contents=contents
+                    ),
+                    timeout=GEMINI_TIMEOUT + 15,
+                )
+                logger.info("Gemini call done in %.1fs (model=%s)", time.monotonic() - t0, current)
+                return resp
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                logger.warning("Gemini timeout after %.0fs (model=%s)", time.monotonic() - t0, current)
+                break  # next model
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                logger.warning("Gemini error (model=%s) after %.1fs: %s", current, time.monotonic() - t0, msg[:300])
+                if "404" in msg or "NOT_FOUND" in msg:
+                    break  # model nomi noto'g'ri -> keyingi model
+                if not _is_rate_limit_error(e):
+                    raise
+                if attempt < MAX_RETRIES - 1:
+                    suggested = _extract_retry_delay(e)
+                    delay = min(suggested if suggested is not None else BASE_DELAY, 8) + random.uniform(0, 1)
+                    await asyncio.sleep(delay)
+        logger.warning("Switching away from model %s", current)
+    raise RuntimeError("Gemini hozir band yoki javob bermayapti. 1 daqiqadan keyin qayta yuboring.")
 
 
 def parse_json_response(text):
