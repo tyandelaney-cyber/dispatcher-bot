@@ -27,7 +27,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-GEMINI_TIMEOUT = 60  # seconds per request
+GEMINI_TIMEOUT = 45  # seconds per request
+TOTAL_DEADLINE = 100  # max seconds for one user request across all models
 client = genai.Client(
     api_key=GEMINI_KEY,
     http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT * 1000),
@@ -132,8 +133,13 @@ async def generate_with_retry(model_name, contents):
     """Tries the primary model, then fallback models if it is overloaded/unavailable."""
     candidates = [model_name] + [m for m in FALLBACK_MODELS if m != model_name]
     last_exc = None
+    deadline = time.monotonic() + TOTAL_DEADLINE
     for current in candidates:
+        if time.monotonic() > deadline:
+            break
         for attempt in range(MAX_RETRIES):
+            if time.monotonic() > deadline:
+                break
             t0 = time.monotonic()
             logger.info("Gemini call start (model=%s, attempt %s/%s)", current, attempt + 1, MAX_RETRIES)
             try:
@@ -141,7 +147,7 @@ async def generate_with_retry(model_name, contents):
                     asyncio.to_thread(
                         client.models.generate_content, model=current, contents=contents
                     ),
-                    timeout=GEMINI_TIMEOUT + 15,
+                    timeout=GEMINI_TIMEOUT + 10,
                 )
                 logger.info("Gemini call done in %.1fs (model=%s)", time.monotonic() - t0, current)
                 return resp
@@ -647,7 +653,7 @@ def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN secret is not set")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Document.ALL, receive_file),
