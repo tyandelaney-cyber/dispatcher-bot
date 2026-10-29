@@ -63,6 +63,9 @@ def _save_authorized():
 
 
 AUTHORIZED_USERS = _load_authorized()
+for _uid in os.environ.get("AUTHORIZED_IDS", "").split(","):
+    if _uid.strip().isdigit():
+        AUTHORIZED_USERS.add(int(_uid.strip()))
 
 
 def is_authorized(user_id):
@@ -641,6 +644,10 @@ async def chat_fallback(update, context):
         await update.message.reply_text("❌ Error: " + str(e))
 
 
+async def on_error(update, context):
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+
+
 def main():
     missing = [n for n, v in [
         ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
@@ -667,12 +674,13 @@ def main():
             CommandHandler("start", start),
         ],
     )
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_fallback))
     logger.info("✅ Bot running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
